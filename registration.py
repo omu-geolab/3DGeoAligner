@@ -11,7 +11,7 @@ import copy
 import datetime
 
 class GlobalRegistration:
-    def __init__(self, voxel_size, resolution=0.01):
+    def __init__(self, voxel_size, resolution):
         """
         resolution: 1ピクセルあたりのメートル数 (例: 0.01 = 1cm)
         """
@@ -237,7 +237,7 @@ class GlobalRegistration:
 
         return best_M, best_inliers_count
 
-    def evaluate_mse(self, img_src, img_tgt, M):
+    def evaluate_mean(self, img_src, img_tgt, M):
         if np.sum(img_src) == 0 or np.sum(img_tgt) == 0: return float('inf')
 
         M_cv = M[:2, :] 
@@ -296,7 +296,7 @@ class GlobalRegistration:
     # -------------------------------------------------------------------------
     # ④-B ICPによる微調整 (追加)
     # -------------------------------------------------------------------------
-    def align_fine_icp(self, pcd_source, pcd_target, threshold=0.5):
+    def align_fine_icp(self, pcd_source, pcd_target, threshold):
         """
         ORB適用後の点群に対して、2D平面上でのICP微調整を行う。
         Z値を0に潰して計算することでXYのみの補正行列を求める。
@@ -319,12 +319,18 @@ class GlobalRegistration:
         
         src.points = o3d.utility.Vector3dVector(np_src)
         tgt.points = o3d.utility.Vector3dVector(np_tgt)
+    
+        criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
+            relative_fitness=1e-6,  # 改善がごくわずかでも継続
+            relative_rmse=1e-6,     # 誤差減少がごくわずかでも継続
+            max_iteration=2000      # 十分な回数を回す
+        )
 
         # ICP実行 (Point-to-Point)
         reg_p2p = o3d.pipelines.registration.registration_icp(
             src, tgt, threshold, np.eye(4),
             o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
+            criteria
         )
         
         print(f"   ICP Fitness: {reg_p2p.fitness:.4f}, RMSE: {reg_p2p.inlier_rmse:.4f}")
@@ -467,7 +473,7 @@ def main():
         M_cand, inliers = gr.align_rigid_orb(img_s, img_t)
         
         if inliers > 10:
-            score = gr.evaluate_mse(img_s, img_t, M_cand)
+            score = gr.evaluate_mean(img_s, img_t, M_cand)
             print(f"   H={h:.1f}m: Error={score:.2f} px, Inliers={inliers}")
             
             if score < best_score:
@@ -506,7 +512,7 @@ def main():
     t_slice_ref = gr.extract_slice(t_nonground, t_ground, best_height, best_height + height_slice_thickness)
     
     # ICPのしきい値は解像度の5倍程度を目安に設定 (例: 10cm解像度なら50cmまで許容して吸着)
-    icp_threshold = args.pixel_size * 5.0
+    icp_threshold = args.pixel_size * 0.75
     M_icp_4x4 = gr.align_fine_icp(s_slice_aligned, t_slice_ref, threshold=icp_threshold)
     
     log_lines.append(f"-" * 50)

@@ -13,6 +13,7 @@ import os
 import sys
 import datetime
 import rasterio
+from scipy.interpolate import NearestNDInterpolator
 
 class AutoGeoreferencer:
     def __init__(self, pixel_size=0.1):
@@ -347,21 +348,20 @@ class AutoGeoreferencer:
         with np.errstate(divide='ignore', invalid='ignore'):
             adjustment_grid = grid_sum / grid_count
 
-        # 5. 穴埋め (Inpainting) - データがない場所を埋める
-        mask = np.isnan(adjustment_grid).astype(np.uint8) * 255
-        # NaNを0にしてOpenCVで扱えるようにする
-        adjustment_grid_fill = np.nan_to_num(adjustment_grid, nan=0.0).astype(np.float32)
+        # # 5. 穴埋め (Inpainting) - データがない場所を埋める
+        # mask = np.isnan(adjustment_grid).astype(np.uint8) * 255
+        # # NaNを0にしてOpenCVで扱えるようにする
+        # adjustment_grid_fill = np.nan_to_num(adjustment_grid, nan=0.0).astype(np.float32)
         
-        # OpenCVのInpaintは8bitか16bit画像が必要だが、ここでは近似的に
-        # navier-stokes等でなく、単純なモルフォロジーやresizeによる穴埋めを行う
-        # 簡易的に、有効な値の平均で埋める（あるいはkNN）
-        # ここでは「Nearest」で粗く埋めた後、Blurする
+        # # OpenCVのInpaintは8bitか16bit画像が必要だが、ここでは近似的に
+        # # navier-stokes等でなく、単純なモルフォロジーやresizeによる穴埋めを行う
+        # # 簡易的に、有効な値の平均で埋める（あるいはkNN）
+        # # ここでは「Nearest」で粗く埋めた後、Blurする
         
         # 有効な値のインデックス
         y_valid, x_valid = np.where(grid_count > 0)
         if len(y_valid) > 0:
             # SciPyのNearestNDInterpolatorで穴埋め
-            from scipy.interpolate import NearestNDInterpolator
             points_valid = np.column_stack((x_valid, y_valid))
             vals_valid = adjustment_grid[y_valid, x_valid]
             interpolator = NearestNDInterpolator(points_valid, vals_valid)
