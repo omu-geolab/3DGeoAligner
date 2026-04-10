@@ -408,29 +408,24 @@ def main():
     parser = argparse.ArgumentParser(description="ORB-based LAS Registration with Fixed Resolution and ICP Refinement")
     parser.add_argument("source", help="Source LAS file")
     parser.add_argument("target", help="Target LAS file")
-    parser.add_argument("--output_path", default="registered.las", help="Output LAS filename")
-    parser.add_argument("--output_dir", default="registration_result", help="Output directory for results")
     parser.add_argument("--voxel_size", type=float, default=0.005, help="Downsample voxel size (m)")
     parser.add_argument("--pixel_size", type=float, default=0.045, help="Projection resolution in meters/pixel (default: 0.1m = 10cm)")
-    
     args = parser.parse_args()
+    
 
-    output_dir = args.output_dir
+    myt_delta = datetime.timedelta(hours=8)
+    MYT = datetime.timezone(myt_delta, 'MYT')
+    timestamp = datetime.datetime.now(MYT).strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join("results", timestamp)
     os.makedirs(output_dir, exist_ok=True)
-    
-    base_output_name = os.path.basename(args.output_path)
-    final_las_path = os.path.join(output_dir, base_output_name)
-    log_path = os.path.join(output_dir, "registration_log.txt")
-    
-    log_lines = []
-    log_lines.append(f"Registration Log - {datetime.datetime.now()}")
-    log_lines.append(f"-" * 50)
-    log_lines.append(f"Source File: {os.path.abspath(args.source)}")
-    log_lines.append(f"Target File: {os.path.abspath(args.target)}")
-    log_lines.append(f"Voxel Size: {args.voxel_size}")
-    log_lines.append(f"Pixel Resolution: {args.pixel_size} m/px")
-    log_lines.append(f"-" * 50)
+    print(f":: Output directory: {os.path.abspath(output_dir)}")
 
+
+    source_name = os.path.splitext(os.path.basename(args.source))[0]
+    target_name = os.path.splitext(os.path.basename(args.target))[0]
+    base_filename = f"{source_name}_reg_to_{target_name}"
+    final_las_path = os.path.join(output_dir, f"{base_filename}.las")
+    
     # GlobalRegistrationの初期化時にピクセル解像度を渡す
     gr = GlobalRegistration(args.voxel_size, resolution=args.pixel_size)
 
@@ -438,16 +433,9 @@ def main():
     pcd_s, raw_las_s = gr.load_las_no_transform(args.source, keep_raw=False)
     pcd_t, _         = gr.load_las_no_transform(args.target, keep_raw=False)
 
-    if pcd_s is None or pcd_t is None: 
-        with open(log_path, "w") as f: f.write("Error: Failed to load LAS files.")
-        return
-
     # 2. 地理的重複領域の抽出
     pcd_s_ov, pcd_t_ov = gr.extract_overlap_region(pcd_s, pcd_t, threshold=1.0)
     
-    log_lines.append(f"Source Overlap Points: {len(pcd_s_ov.points)} / {len(pcd_s.points)}")
-    log_lines.append(f"Target Overlap Points: {len(pcd_t_ov.points)} / {len(pcd_t.points)}")
-
     # 3. 地面除去 (CSF)
     print(":: Filtering ground with CSF...")
     s_ground, s_nonground = gr.filter_ground_csf(pcd_s_ov)
@@ -485,12 +473,6 @@ def main():
 
     print(f"\n:: Best Result -> Height: {best_height:.1f}m, Error: {best_score:.2f}")
     
-    log_lines.append(f"-" * 50)
-    log_lines.append(f"Optimization Result:")
-    log_lines.append(f"  Best Height Slice: {best_height:.2f} m")
-    log_lines.append(f"  Minimum Error (MSE): {best_score:.4f} px")
-    log_lines.append(f"  Estimated Rigid Matrix (Pixel space):\n{best_M}")
-
     # 5. 最終的な適用と保存
     print(":: Applying transform to full resolution cloud...")
     
@@ -515,10 +497,6 @@ def main():
     icp_threshold = args.pixel_size * 0.75
     M_icp_4x4 = gr.align_fine_icp(s_slice_aligned, t_slice_ref, threshold=icp_threshold)
     
-    log_lines.append(f"-" * 50)
-    log_lines.append(f"ICP Refinement (XY Plane):")
-    log_lines.append(f"  Matrix:\n{M_icp_4x4}")
-
     # ICPの結果を全体と地面点群に適用
     pcd_full_aligned.transform(M_icp_4x4)
     s_ground_aligned.transform(M_icp_4x4)
@@ -527,20 +505,12 @@ def main():
     # ICP補正後の地面点群を使ってチルトを計算
     a, b, c = gr.calculate_tilt_and_shift(s_ground_aligned, t_ground)
     
-    log_lines.append(f"-" * 50)
-    log_lines.append(f"Z-Axis Tilt Correction:")
-    log_lines.append(f"  Slope X (a): {a:.8f}")
-    log_lines.append(f"  Slope Y (b): {b:.8f}")
-    log_lines.append(f"  Shift Z (c): {c:.8f}")
-
     pts_final = np.asarray(pcd_full_aligned.points)
     z_adjustment = (a * pts_final[:, 0]) + (b * pts_final[:, 1]) + c
     pts_final[:, 2] += z_adjustment
 
     # 保存
     gr.save_aligned_las(final_las_path, raw_las_s, pts_final)
-    log_lines.append(f"-" * 50)
-    log_lines.append(f"Output Saved: {os.path.abspath(final_las_path)}")
 
     # ---------------------------------------------------------
     # 画像による位置合わせ確認 (Overlay Image Output)
@@ -566,15 +536,10 @@ def main():
     overlay_img[..., 1] = img_s_final 
     overlay_img[..., 2] = img_t_final 
 
-    img_output_path = os.path.splitext(final_las_path)[0] + "_overlay.png"
+    img_output_path = os.path.join(output_dir, f"{base_filename}_overlay.png")
     cv2.imwrite(img_output_path, overlay_img)
     print(f"[Saved Image] {img_output_path}")
     
-    log_lines.append(f"Overlay Image Saved: {os.path.abspath(img_output_path)}")
-
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(log_lines))
-    print(f"[Saved Log] {log_path}")
 
 if __name__ == "__main__":
     main()

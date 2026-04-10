@@ -1,0 +1,9 @@
+
+services:
+  geo_aligner:
+    build: .
+    container_name: geo_aligner_v1
+    volumes:
+      - .:/app
+    working_dir: /app
+    tty: true

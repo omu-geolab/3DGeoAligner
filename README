@@ -1,0 +1,37 @@
+#　フォルダ構成
+GeoAligner/                (プロジェクトのルートフォルダ)
+│
+| --- [環境・設定ファイル群] ---
+├── dockerfile             (File: コンテナの設計図)
+├── docker-compose.yaml    (File: コンテナの起動・設定)
+├── requirements.txt       (File: Pythonライブラリのリスト)
+├── .gitignore             (File: Git管理から除外するリスト)
+├── README.md              (File: プロジェクト概要・動かし方の説明)
+│
+| --- [ソースコード・実行スクリプト群] ---
+├── scripts/                   (Folder: メインのソースコード一式)
+│   ├── main.py            (File: 実行の起点となるスクリプト)
+│   ├── georeference.py    (File: 幾何補正などの個別モジュール)
+│   └── registration.py    (File: 位置合わせなどの個別モジュール)
+│
+| --- [データ管理群] ---
+├── data/                  (Folder: データの保管場所)
+│   ├── raw/               (Folder: 読み取り専用の生データ)
+│   └── processed/         (Folder: 前処理済みの加工データ)
+│
+| --- [実験結果・出力群] ---
+├── results/               (Folder: プログラムが生成した成果物)
+│   ├── figures/           (Folder: グラフや可視化画像)
+│   ├── models/            (Folder: 学習済みモデルや重みなど)
+│   └── logs/              (Folder: 実行ログや精度記録のテキスト)
+│
+| --- [研究プロセス・分析群] ---
+├── notebooks/             (Folder: Jupyter Notebookなどの試行錯誤用)
+└── docs/                  (Folder: 関連論文のPDFや研究メモ)
+
+# 仮想環境の動かし方
+・コンテナ立ち上げ(再起動): docker-compose up -d
+・コンテナ入室: docker-compose exec geo_aligner bash
+・コンテナ退出: exit
+・コンテナ一時停止: docker
+・コンテナ完全削除: docker compose down

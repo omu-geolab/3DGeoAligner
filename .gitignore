@@ -1,0 +1,14 @@
+# 重いデータファイル
+*.las
+*.xlsx
+
+# 除外フォルダ
+data/
+results/
+
+#布ノードファイル
+cloth_nodes.txt
+
+# Docker関連の不要ファイル
+__pycache__/
+.venv/
