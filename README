@@ -35,3 +35,10 @@ GeoAligner/                (プロジェクトのルートフォルダ)
 ・コンテナ退出: exit
 ・コンテナ一時停止: docker
 ・コンテナ完全削除: docker compose down
+
+# デモプレイ
+## registration.py
+python scripts/registration.py data/raw/20251211_tondabayashi/epsg32653/scaniverse_tondabayashi_02.las data/raw/20251211_tondabayashi/epsg32653/scaniverse_tondabayashi_01.las
+
+## georeference.py
+python scripts/georeference.py data/raw/20251211_tondabayashi/epsg32653/scaniverse_tondabayashi_01.las  data/raw/road_edge/20251001-道路縁.shp data/raw/5mdem/FG-GML-5135-54-98-DEM5A-20250620.tif

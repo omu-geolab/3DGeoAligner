@@ -454,8 +454,6 @@ def georeference_main():
     parser.add_argument("las_path", help="Input LAS file path")
     parser.add_argument("shp_path", help="Reference Road Edge SHP file path")
     parser.add_argument("dem_path",  help="Reference DEM GeoTIFF path")
-    parser.add_argument("--output_las", default="auto_georeferenced.las", help="Output LAS filename")
-    parser.add_argument("--output_dir", default="auto_georeference_result", help="Output directory path")
     parser.add_argument("--las_epsg", type=int, default="32653", help="Original EPSG code of LAS") #Scaniverseで取得した点群は EPSG:32653 (UTM53N)
     parser.add_argument("--target_epsg", type=int, default=None, help="Force Target EPSG code")
     parser.add_argument("--pixel_size", type=float, default=0.1, help="Pixel size in meters")
@@ -463,9 +461,12 @@ def georeference_main():
     
     args = parser.parse_args()
 
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
-    print(f":: Output directory: {os.path.abspath(output_dir)}")
+    myt_delta = datetime.timedelta(hours=8)
+    MYT = datetime.timezone(myt_delta, 'MYT')
+    timestamp = datetime.datetime.now(MYT).strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join("results", f"G_{timestamp}")
+    os.makedirs(output_dir, exist_ok = True)
+    print(f"::Output directory {os.path.abspath(output_dir)}")
 
     geo = AutoGeoreferencer(pixel_size=args.pixel_size)
 
@@ -524,7 +525,8 @@ def georeference_main():
             geo.align_z_smoothly(las_data, args.dem_path, target_crs, smooth_kernel_size=args.smooth_kernel)
         
         # Save
-        output_filename = os.path.basename(args.output_las)
+        base_name = os.path.splitext(os.path.basename(args.las_path))[0]
+        output_filename = f"{base_name}_AG.las"
         final_output_path = os.path.join(output_dir, output_filename)
         geo.save_las(las_data, final_output_path, target_crs)
 

@@ -416,7 +416,7 @@ def main():
     myt_delta = datetime.timedelta(hours=8)
     MYT = datetime.timezone(myt_delta, 'MYT')
     timestamp = datetime.datetime.now(MYT).strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join("results", timestamp)
+    output_dir = os.path.join("results", f"R_{timestamp}")
     os.makedirs(output_dir, exist_ok=True)
     print(f":: Output directory: {os.path.abspath(output_dir)}")
 
