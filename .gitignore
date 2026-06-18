@@ -14,3 +14,6 @@ cloth_nodes.txt
 # Docker関連の不要ファイル
 __pycache__/
 .venv/
+
+# このファイル
+.gitignore
