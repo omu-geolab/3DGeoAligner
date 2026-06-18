@@ -1,44 +1,40 @@
+"""
+Automatic point cloud registration
+"""
+
 import argparse
 import open3d as o3d
 import numpy as np
-import pandas as pd
 import laspy as lp
 import cv2
 import os
+import re
 import CSF
 from scipy.spatial import cKDTree
 import copy
 import datetime
 
-class GlobalRegistration:
+
+class AutoRegistrator:
+    """Executes automatic point cloud registration."""
     def __init__(self, voxel_size, resolution):
-        """
-        resolution: 1ピクセルあたりのメートル数 (例: 0.01 = 1cm)
-        """
         self.voxel_size = voxel_size
-        self.resolution = resolution
-        # スケールは固定 (1m を何ピクセルにするか -> 1 / 0.01 = 100px)
-        self.scale = 1.0 / self.resolution
-        
+        self.scale = 1.0 / resolution
         self.min_xy = None
+        self.max_xy = None
         self.img_w = 0
         self.img_h = 0
 
-    # -------------------------------------------------------------------------
-    # ① LASデータの読み込み (座標系変換なし)
-    # -------------------------------------------------------------------------
-    def load_las_no_transform(self, input_path, keep_raw=False):
-        print(f":: Loading {input_path}...")
+    def load_las(self, input_path, keep_raw):
+        print(f":: Loading LAS file: {input_path}")
+
         try:
             las = lp.read(input_path)
         except Exception as e:
             print(f"!! Error reading LAS: {e}")
             return None, None
 
-        x = las.x
-        y = las.y
-        z = las.z
-        points = np.vstack((x, y, z)).T
+        points = np.vstack((las.x, las.y, las.z)).T
 
         if hasattr(las, 'red'):
             colors = np.stack([las.red, las.green, las.blue], axis=1)
@@ -53,183 +49,152 @@ class GlobalRegistration:
 
         if self.voxel_size > 0 and not keep_raw:
             pcd = pcd.voxel_down_sample(self.voxel_size)
-        
+        print(f"   -> Loaded {len(pcd.points)} points (downsampled with voxel={self.voxel_size}m)")
         return pcd, las
 
-    # -------------------------------------------------------------------------
-    # ② 地理的重複領域の抽出
-    # -------------------------------------------------------------------------
-    def extract_overlap_region(self, pcd1, pcd2, threshold=5.0):
-        pts1 = np.asarray(pcd1.points)
-        pts2 = np.asarray(pcd2.points)
+    def extract_overlap(self, src_pcd, tgt_pcd, threshold):
+        print(f":: Extracting overlap region (XY threshold: {threshold}m)")
 
-        if len(pts1) == 0 or len(pts2) == 0:
+        src_pts = np.asarray(src_pcd.points)
+        tgt_pts = np.asarray(tgt_pcd.points)
+
+        if len(src_pts) == 0 or len(tgt_pts) == 0:
             return o3d.geometry.PointCloud(), o3d.geometry.PointCloud()
 
-        pts1_xy = pts1[:, :2]
-        pts2_xy = pts2[:, :2]
+        tgt_tree = cKDTree(tgt_pts[:, :2])
+        src_dists, _ = tgt_tree.query(src_pts[:, :2], k=1, workers=-1)
+        src_mask = src_dists < threshold
 
-        print(f":: Extracting Overlap (XY Threshold: {threshold}m)...")
-
-        tree2 = cKDTree(pts2_xy)
-        dists1, _ = tree2.query(pts1_xy, k=1, workers=-1)
-        mask1 = dists1 < threshold
-
-        tree1 = cKDTree(pts1_xy)
-        dists2, _ = tree1.query(pts2_xy, k=1, workers=-1)
-        mask2 = dists2 < threshold
-
-        print(f"   Src overlap: {np.sum(mask1)} / {len(pts1)}")
-        print(f"   Tgt overlap: {np.sum(mask2)} / {len(pts2)}")
-
-        return pcd1.select_by_index(np.where(mask1)[0]), pcd2.select_by_index(np.where(mask2)[0])
-
-    # -------------------------------------------------------------------------
-    # ③ 点群のスライス化・画像化 (CSF使用)
-    # -------------------------------------------------------------------------
-    def filter_ground_csf(self, pcd):
-        csf = CSF.CSF()
-        csf.params.cloth_resolution = 1.0
-        csf.params.rigidness = 3
-        csf.params.class_threshold = 0.5
+        src_tree = cKDTree(src_pts[:, :2])
+        tgt_dists, _ = src_tree.query(tgt_pts[:, :2], k=1, workers=-1)
+        tgt_mask = tgt_dists < threshold
+        print(f"   -> Src: {np.sum(src_mask)} / {len(src_pts)} pts | Tgt: {np.sum(tgt_mask)} / {len(tgt_pts)} pts")
         
+        return src_pcd.select_by_index(np.where(src_mask)[0]), tgt_pcd.select_by_index(np.where(tgt_mask)[0])
+
+    def filter_ground(self, pcd, cloth_resolution, rigidness, class_threshold):
+        print(":: Filtering ground with CSF")
+
+        csf = CSF.CSF()
+        csf.params.cloth_resolution = cloth_resolution
+        csf.params.rigidness = rigidness
+        csf.params.class_threshold = class_threshold
+
         points = np.asarray(pcd.points, dtype=np.float64)
         csf.setPointCloud(points)
-        
+
         ground_indices = CSF.VecInt()
         non_ground_indices = CSF.VecInt()
-        
         csf.do_filtering(ground_indices, non_ground_indices)
-        
+
         ground = pcd.select_by_index(list(ground_indices))
         non_ground = pcd.select_by_index(list(non_ground_indices))
+        print(f"   -> Ground: {len(ground.points)} pts | Non-ground: {len(non_ground.points)} pts")
         
         return ground, non_ground
 
     def extract_slice(self, non_ground, ground, h_min, h_max):
-        ng_pts = np.asarray(non_ground.points)
-        g_pts = np.asarray(ground.points)
-        
-        if len(g_pts) == 0 or len(ng_pts) == 0:
+        pts_ng = np.asarray(non_ground.points)
+        pts_g = np.asarray(ground.points)
+
+        if len(pts_g) == 0 or len(pts_ng) == 0:
             return o3d.geometry.PointCloud()
 
-        tree = cKDTree(g_pts[:, :2])
-        _, idx = tree.query(ng_pts[:, :2], k=1)
-        ground_z = g_pts[idx, 2]
-        
-        diff = ng_pts[:, 2] - ground_z
+        tree = cKDTree(pts_g[:, :2])
+        _, idx = tree.query(pts_ng[:, :2], k=1)
+        ground_z = pts_g[idx, 2]
+
+        diff = pts_ng[:, 2] - ground_z
         mask = (diff >= h_min) & (diff < h_max)
-        
-        sliced = non_ground.select_by_index(np.where(mask)[0])
-        return sliced
 
-    def pcd_to_image(self, pcd_src, pcd_tgt):
-        pts_src = np.asarray(pcd_src.points)
-        pts_tgt = np.asarray(pcd_tgt.points)
-        
-        # キャンバスサイズの決定（初回のみ、または未設定時）
-        # 固定スケールに基づき、全点群が入る画像サイズを計算する
+        return non_ground.select_by_index(np.where(mask)[0])
+
+    def project_to_image(self, src_pcd, tgt_pcd):
+        src_pts = np.asarray(src_pcd.points)
+        tgt_pts = np.asarray(tgt_pcd.points)
+
         if self.min_xy is None:
-            pts_all = np.vstack([pts_src[:, :2], pts_tgt[:, :2]]) if len(pts_src)>0 and len(pts_tgt)>0 else pts_src[:,:2]
-            
+            if len(src_pts) > 0 and len(tgt_pts) > 0:
+                pts_all = np.vstack([src_pts[:, :2], tgt_pts[:, :2]])
+            else:
+                return None, None
             if len(pts_all) > 0:
-                # 最小座標を決定し、少しマージンを持たせる
                 self.min_xy = pts_all.min(axis=0)
-                max_xy = pts_all.max(axis=0)
-                
-                # ワールド座標での幅・高さ
-                width_m = max_xy[0] - self.min_xy[0]
-                height_m = max_xy[1] - self.min_xy[1]
-                
-                # ピクセル数に変換 (ceilで切り上げ)
-                self.img_w = int(np.ceil(width_m * self.scale)) + 10  # +10px padding
+                self.max_xy = pts_all.max(axis=0)
+                width_m = self.max_xy[0] - self.min_xy[0]
+                height_m = self.max_xy[1] - self.min_xy[1]
+                self.img_w = int(np.ceil(width_m * self.scale)) + 10
                 self.img_h = int(np.ceil(height_m * self.scale)) + 10
-                
-                print(f":: Image Canvas Size: {self.img_w} x {self.img_h} (Scale: {self.scale:.2f} px/m)")
-
+                print(f":: Projecting point cloud to 2D image")
+        
         def project(pts):
-            if len(pts) == 0: return np.zeros((self.img_h, self.img_w), dtype=np.uint8)
-            
-            # 座標変換: (World - Min) * Scale
-            pts_norm = (pts[:, :2] - self.min_xy) * self.scale
-            pts_norm = np.round(pts_norm).astype(np.int32)
-            
+            if len(pts) == 0:
+                return np.zeros((self.img_h, self.img_w), dtype=np.uint8)
+            px = np.round(((pts[:, 0] - self.min_xy[0]) * self.scale)).astype(np.int32)
+            py = np.round(((self.max_xy[1] - pts[:, 1]) * self.scale)).astype(np.int32)
+            pts_norm = np.column_stack([px, py])
             img = np.zeros((self.img_h, self.img_w), dtype=np.uint8)
-            
-            # 画像範囲内の点のみ描画
-            valid_mask = (pts_norm[:, 0] >= 0) & (pts_norm[:, 0] < self.img_w) & \
-                         (pts_norm[:, 1] >= 0) & (pts_norm[:, 1] < self.img_h)
-            pts_valid = pts_norm[valid_mask]
-            
-            # 画像座標系へ (Y軸反転: 下から上へ伸びるWorld座標を、上から下のImage座標へ)
-            # img[h - y - 1, x]
-            img[self.img_h - pts_valid[:, 1] - 1, pts_valid[:, 0]] = 255
+            valid = (
+                (pts_norm[:, 0] >= 0) & (pts_norm[:, 0] < self.img_w) &
+                (pts_norm[:, 1] >= 0) & (pts_norm[:, 1] < self.img_h)
+            )
+            pv = pts_norm[valid]
+            img[pv[:, 1], pv[:, 0]] = 255
             return img
+        return project(src_pts), project(tgt_pts)
 
-        return project(pts_src), project(pts_tgt)
-
-    # -------------------------------------------------------------------------
-    # ④ ORB特徴量による位置合わせ
-    # -------------------------------------------------------------------------
-    def estimate_similarity_fixed_scale(self, src_pts, tgt_pts):
+    def estimate_similarity(self, src_pts, tgt_pts):
         src_mean = np.mean(src_pts, axis=0)
         tgt_mean = np.mean(tgt_pts, axis=0)
-        src_centered = src_pts - src_mean
-        tgt_centered = tgt_pts - tgt_mean
+        src_c = src_pts - src_mean
+        tgt_c = tgt_pts - tgt_mean
 
-        U, _, Vt = np.linalg.svd(src_centered.T @ tgt_centered)
+        U, _, Vt = np.linalg.svd(src_c.T @ tgt_c)
         R = Vt.T @ U.T
         if np.linalg.det(R) < 0:
-            Vt[1,:] *= -1
+            Vt[1, :] *= -1
             R = Vt.T @ U.T
         t = tgt_mean - R @ src_mean
-        return np.hstack([R, t.reshape(2,1)])
+        return np.hstack([R, t.reshape(2, 1)])
 
-    def align_rigid_orb(self, img_src, img_tgt):
-        if np.sum(img_src) == 0 or np.sum(img_tgt) == 0:
+    def register_with_ORB(self, src_img, tgt_img, orb_nfeatures, ransac_iter, ransac_threshold, lowe_ratio):
+        if np.sum(src_img) == 0 or np.sum(tgt_img) == 0:
             return np.eye(3), 0
 
-        # 解像度が高いと特徴点が増えすぎる可能性があるため数を調整
-        orb = cv2.ORB_create(5000)
-        kp1, des1 = orb.detectAndCompute(img_src, None)
-        kp2, des2 = orb.detectAndCompute(img_tgt, None)
+        orb = cv2.ORB_create(orb_nfeatures)
+        src_kp, src_des = orb.detectAndCompute(src_img, None)
+        tgt_kp, tgt_des = orb.detectAndCompute(tgt_img, None)
 
-        if des1 is None or des2 is None or len(des1) < 5 or len(des2) < 5:
+        if src_des is None or tgt_des is None or len(src_des) < 5 or len(tgt_des) < 5:
             return np.eye(3), 0
 
         bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        matches = bf.knnMatch(des1, des2, k=2)
-        
+        matches = bf.knnMatch(src_des, tgt_des, k=2)
+
         good = []
         for m, n in matches:
-            if m.distance < 0.75 * n.distance:
+            if m.distance < lowe_ratio * n.distance:
                 good.append(m)
 
         if len(good) < 5:
             return np.eye(3), 0
 
-        src_pts = np.float32([kp1[m.queryIdx].pt for m in good])
-        tgt_pts = np.float32([kp2[m.trainIdx].pt for m in good])
+        src_pts = np.float32([src_kp[m.queryIdx].pt for m in good])
+        tgt_pts = np.float32([tgt_kp[m.trainIdx].pt for m in good])
 
         best_inliers_count = 0
         best_M = np.eye(3)
-        
-        n_iter = 10000
-        # 1cm解像度の場合、許容誤差5px = 5cm程度
-        threshold = 3.0 
         N = len(src_pts)
-        
-        for _ in range(n_iter):
-            if N < 2: break
+
+        for _ in range(ransac_iter):
+            if N < 2:
+                break
             idx = np.random.choice(N, 2, replace=False)
-            M_cand_2x3 = self.estimate_similarity_fixed_scale(src_pts[idx], tgt_pts[idx])
-            
-            src_homo = np.hstack([src_pts, np.ones((N,1))])
+            M_cand_2x3 = self.estimate_similarity(src_pts[idx], tgt_pts[idx])
+            src_homo = np.hstack([src_pts, np.ones((N, 1))])
             transformed = (M_cand_2x3 @ src_homo.T).T
-            
             errors = np.linalg.norm(transformed - tgt_pts, axis=1)
-            inliers = np.sum(errors < threshold)
-            
+            inliers = np.sum(errors < ransac_threshold)
             if inliers > best_inliers_count:
                 best_inliers_count = inliers
                 best_M = np.eye(3)
@@ -237,37 +202,35 @@ class GlobalRegistration:
 
         return best_M, best_inliers_count
 
-    def evaluate_mean(self, img_src, img_tgt, M):
-        if np.sum(img_src) == 0 or np.sum(img_tgt) == 0: return float('inf')
+    def calculate_mean(self, src_img, tgt_img, M):
+        if np.sum(src_img) == 0 or np.sum(tgt_img) == 0:
+            return float('inf')
 
-        M_cv = M[:2, :] 
-        src_y, src_x = np.where(img_src > 0)
-        if len(src_x) == 0: return float('inf')
+        M_cv = M[:2, :]
+        src_y, src_x = np.where(src_img > 0)
+        if len(src_x) == 0:
+            return float('inf')
         src_pts = np.column_stack([src_x, src_y]).astype(np.float32).reshape(-1, 1, 2)
-        src_trans = cv2.transform(src_pts, M_cv).reshape(-1, 2)
+        src_pts_trans = cv2.transform(src_pts, M_cv).reshape(-1, 2)
 
-        tgt_y, tgt_x = np.where(img_tgt > 0)
-        if len(tgt_x) == 0: return float('inf')
+        tgt_y, tgt_x = np.where(tgt_img > 0)
+        if len(tgt_x) == 0:
+            return float('inf')
         tgt_pts = np.column_stack([tgt_x, tgt_y])
-        
+
         tree = cKDTree(tgt_pts)
-        dists, _ = tree.query(src_trans, k=1)
+        dists, _ = tree.query(src_pts_trans, k=1)
         return np.mean(dists)
 
-    def apply_rigid_transform(self, pcd, M_pixel):
+    def apply_transform(self, pcd, M_pixel):
         if pcd.is_empty():
-            return pcd
+            return pcd, np.eye(4)
 
         s = self.scale
         mx, my = self.min_xy
-        H = self.img_h  # 計算された高さを使用
-        
-        # Image -> World への変換マトリクス構築
-        # Pixel (u, v) -> World (x, y)
-        # u = (x - mx) * s  => x = u/s + mx
-        # v = H - 1 - (y - my) * s => y = my + (H - 1 - v)/s
-        
-        # T_w2i (World to Image Matrix)
+        H = self.img_h
+
+        # World-to-image transform (T_w2i)
         T_w2i = np.eye(3)
         T_w2i[0, 0] = s
         T_w2i[0, 2] = -s * mx
@@ -277,269 +240,430 @@ class GlobalRegistration:
         try:
             T_i2w = np.linalg.inv(T_w2i)
         except np.linalg.LinAlgError:
-            return pcd
+            return pcd, np.eye(4)
 
-        # ピクセル空間での回転移動行列をワールド空間へ変換
+        # Convert pixel-space transform to world-space
         M_world_2d = T_i2w @ M_pixel @ T_w2i
-        
+
         M_world_3d = np.eye(4)
         M_world_3d[:2, :2] = M_world_2d[:2, :2]
-        M_world_3d[:2, 3]  = M_world_2d[:2, 2]
+        M_world_3d[:2, 3] = M_world_2d[:2, 2]
 
-        # print(":: Applying restored rigid transformation (XY-only Matrix):")
-        
         new_pcd = copy.deepcopy(pcd)
         new_pcd.transform(M_world_3d)
-        
-        return new_pcd
 
-    # -------------------------------------------------------------------------
-    # ④-B ICPによる微調整 (追加)
-    # -------------------------------------------------------------------------
-    def align_fine_icp(self, pcd_source, pcd_target, threshold):
-        """
-        ORB適用後の点群に対して、2D平面上でのICP微調整を行う。
-        Z値を0に潰して計算することでXYのみの補正行列を求める。
-        """
-        print(f":: Running 2D-ICP Refinement (Threshold: {threshold}m)...")
-        
-        # オリジナルを保持するためコピー
-        src = copy.deepcopy(pcd_source)
-        tgt = copy.deepcopy(pcd_target)
+        return new_pcd, M_world_3d
 
-        # 3D点群を2D平面に射影 (Z=0)
-        np_src = np.asarray(src.points)
-        np_tgt = np.asarray(tgt.points)
-        
-        if len(np_src) == 0 or len(np_tgt) == 0:
+    def register_with_2DICP(self, src_pcd, tgt_pcd, threshold, max_iteration, relative_fitness, relative_rmse):
+        print(f":: Running 2D-ICP refinement (threshold: {threshold}m)")
+
+        src = copy.deepcopy(src_pcd)
+        tgt = copy.deepcopy(tgt_pcd)
+
+        src_pts = np.asarray(src.points)
+        tgt_pts = np.asarray(tgt.points)
+
+        if len(src_pts) == 0 or len(tgt_pts) == 0:
             return np.eye(4)
 
-        np_src[:, 2] = 0
-        np_tgt[:, 2] = 0
-        
-        src.points = o3d.utility.Vector3dVector(np_src)
-        tgt.points = o3d.utility.Vector3dVector(np_tgt)
-    
+        src_pts[:, 2] = 0
+        tgt_pts[:, 2] = 0
+        src.points = o3d.utility.Vector3dVector(src_pts)
+        tgt.points = o3d.utility.Vector3dVector(tgt_pts)
+
         criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
-            relative_fitness=1e-6,  # 改善がごくわずかでも継続
-            relative_rmse=1e-6,     # 誤差減少がごくわずかでも継続
-            max_iteration=2000      # 十分な回数を回す
+            relative_fitness=relative_fitness,
+            relative_rmse=relative_rmse,
+            max_iteration=max_iteration
         )
 
-        # ICP実行 (Point-to-Point)
         reg_p2p = o3d.pipelines.registration.registration_icp(
             src, tgt, threshold, np.eye(4),
             o3d.pipelines.registration.TransformationEstimationPointToPoint(),
             criteria
         )
-        
-        print(f"   ICP Fitness: {reg_p2p.fitness:.4f}, RMSE: {reg_p2p.inlier_rmse:.4f}")
-        return reg_p2p.transformation
 
-    # -------------------------------------------------------------------------
-    # ⑤ Z軸の傾きと高さの最適化
-    # -------------------------------------------------------------------------
-    def calculate_tilt_and_shift(self, s_ground_aligned, t_ground):
-        pts_s = np.asarray(s_ground_aligned.points)
-        pts_t = np.asarray(t_ground.points)
+        print(f"   -> Fitness: {reg_p2p.fitness:.4f}, RMSE: {reg_p2p.inlier_rmse:.4f}m")
+        return reg_p2p.transformation, reg_p2p.fitness, reg_p2p.inlier_rmse
 
-        if len(pts_s) < 10 or len(pts_t) < 10:
-            print("!! Not enough ground points for tilt optimization.")
+    def estimate_tilt_shift(self, src_ground_aligned, tgt_ground):
+        src_pts = np.asarray(src_ground_aligned.points)
+        tgt_pts = np.asarray(tgt_ground.points)
+
+        if len(src_pts) < 10 or len(tgt_pts) < 10:
+            print("!! Not enough ground points for Z correction")
             return 0.0, 0.0, 0.0
 
-        tree = cKDTree(pts_t[:, :2])
-        dists, indices = tree.query(pts_s[:, :2], k=1, distance_upper_bound=0.5)
+        tree = cKDTree(tgt_pts[:, :2])
+        dists, indices = tree.query(src_pts[:, :2], k=1, distance_upper_bound=0.5)
 
         valid = dists != float('inf')
         if np.sum(valid) < 10:
-            print("!! Not enough overlapping ground points found.")
-            z_diff = np.mean(pts_t[:, 2]) - np.mean(pts_s[:, 2])
+            print("!! Too few overlapping ground points; falling back to mean Z shift")
+            z_diff = np.mean(tgt_pts[:, 2]) - np.mean(src_pts[:, 2])
             return 0.0, 0.0, z_diff
 
-        x_s = pts_s[valid, 0]
-        y_s = pts_s[valid, 1]
-        z_s = pts_s[valid, 2]
-        z_t = pts_t[indices[valid], 2]
+        x_s = src_pts[valid, 0]
+        y_s = src_pts[valid, 1]
+        z_s = src_pts[valid, 2]
+        z_t = tgt_pts[indices[valid], 2]
 
         diff_z = z_t - z_s
         A = np.vstack([x_s, y_s, np.ones(len(x_s))]).T
-        
         coeffs, _, _, _ = np.linalg.lstsq(A, diff_z, rcond=None)
-        
         a, b, c = coeffs
-        print(f":: Tilt Optimization Result -> Slope X(a): {a:.6f}, Slope Y(b): {b:.6f}, Shift Z(c): {c:.4f}")
-        
+
+        print(f"   -> Tilt X: {a:.6f}, Tilt Y: {b:.6f}, Z shift: {c:.4f}m")
         return a, b, c
 
-    # -------------------------------------------------------------------------
-    # ⑥ LAS保存
-    # -------------------------------------------------------------------------
-    def save_aligned_las(self, output_path, original_las, aligned_points):
-        print(f"[Saving LAS] {output_path}")
+    def save_las(self, output_path, original_las, aligned_points):
+        print(f":: Saving registered point cloud as LAS: {output_path}")
         try:
             min_coords = np.min(aligned_points, axis=0)
-            
+
             new_header = lp.LasHeader(point_format=original_las.header.point_format, version=original_las.header.version)
             new_header.offsets = min_coords
             new_header.scales = original_las.header.scales
-            
+
             new_las = lp.LasData(header=new_header)
             new_las.x = aligned_points[:, 0]
             new_las.y = aligned_points[:, 1]
             new_las.z = aligned_points[:, 2]
-            
-            copy_dims = ['red', 'green', 'blue', 'intensity', 'classification']
-            for dim in copy_dims:
+
+            for dim in ['red', 'green', 'blue', 'intensity', 'classification']:
                 try:
-                    data = getattr(original_las, dim)
-                    setattr(new_las, dim, data)
-                except:
+                    setattr(new_las, dim, getattr(original_las, dim))
+                except Exception:
                     pass
-            
+
             new_las.write(output_path)
-            print(":: Save successful.")
+            print(f"   -> Saved {len(aligned_points)} points successfully")
         except Exception as e:
             print(f"!! Error saving LAS: {e}")
 
-# -------------------------------------------------------------------------
-# Main Execution
-# -------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="ORB-based LAS Registration with Fixed Resolution and ICP Refinement")
-    parser.add_argument("source", help="Source LAS file")
-    parser.add_argument("target", help="Target LAS file")
-    parser.add_argument("--voxel_size", type=float, default=0.005, help="Downsample voxel size (m)")
-    parser.add_argument("--pixel_size", type=float, default=0.045, help="Projection resolution in meters/pixel (default: 0.1m = 10cm)")
-    args = parser.parse_args()
-    
 
-    myt_delta = datetime.timedelta(hours=8)
-    MYT = datetime.timezone(myt_delta, 'MYT')
-    timestamp = datetime.datetime.now(MYT).strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join("results", f"R_{timestamp}")
+class RegistrationExporter:
+    """Handles overlay image and log output for a registration run."""
+    def __init__(self, log_dir, base_filename, resolution):
+        self.log_dir = log_dir
+        self.base_filename = base_filename
+        self.scale = 1 / resolution
+        self.kernel = np.ones((3, 3), np.uint8)        
+        self.ground_bounds = None
+        self.side_w = None
+        self.side_h = None
+
+    def save_slice_overlay(self, src_slice, tgt_slice, global_reg, suffix):
+        src_img, tgt_img = global_reg.project_to_image(src_slice, tgt_slice)
+        h_img, w_img = tgt_img.shape
+        
+        overlay_img = np.zeros((h_img, w_img, 3), dtype=np.uint8)
+        overlay_img[..., 1] = src_img
+        overlay_img[..., 2] = tgt_img
+        
+        img_output_path = os.path.join(self.log_dir, f"{self.base_filename}_{suffix}_overlay.png")
+        cv2.imwrite(img_output_path, overlay_img)
+        print(f"   -> Saved: {img_output_path}")
+
+    def init_ground_bounds(self, tgt_ground, src_ground_init):
+        if self.ground_bounds is None:
+            tgt_pts = np.asarray(tgt_ground.points)
+            src_pts = np.asarray(src_ground_init.points)
+            
+            all_x = np.concatenate([tgt_pts[:, 0], src_pts[:, 0]])
+            all_z = np.concatenate([tgt_pts[:, 2], src_pts[:, 2]])
+            
+            raw_min_x, raw_max_x = all_x.min(), all_x.max()
+            raw_min_z, raw_max_z = all_z.min(), all_z.max()
+            
+            raw_range_x = raw_max_x - raw_min_x if raw_max_x != raw_min_x else 1.0
+            raw_range_z = raw_max_z - raw_min_z if raw_max_z != raw_min_z else 1.0
+                        
+            min_x, max_x = raw_min_x - 10, raw_max_x + 10
+            min_z, max_z = raw_min_z - 10, raw_max_z + 10
+            
+            range_x = max_x - min_x
+            range_z = max_z - min_z
+            
+            self.side_w = int(np.ceil(range_x * self.scale))
+            self.side_h = int(np.ceil(range_z * self.scale))
+            
+            self.ground_bounds = (min_x, min_z)
+
+    def project_to_side_view(self, pts):
+        img = np.zeros((self.side_h, self.side_w), dtype=np.uint8)
+        if len(pts) == 0 or self.ground_bounds is None:
+            return img
+            
+        min_x, min_z = self.ground_bounds
+        
+        x_px = ((pts[:, 0] - min_x) * self.scale).astype(np.int32)
+        z_px = ((pts[:, 2] - min_z) * self.scale).astype(np.int32)
+        
+        valid = (x_px >= 0) & (x_px < self.side_w) & (z_px >= 0) & (z_px < self.side_h)
+        
+        img[self.side_h - z_px[valid] - 1, x_px[valid]] = 255
+        return cv2.dilate(img, self.kernel, iterations=1)
+
+    def save_ground_side_overlay(self, src_ground, tgt_ground, suffix):
+        self.init_ground_bounds(tgt_ground, src_ground)
+        
+        tgt_pts = np.asarray(tgt_ground.points)
+        src_pts = np.asarray(src_ground.points)
+        
+        tgt_img = self.project_to_side_view(tgt_pts)
+        src_img = self.project_to_side_view(src_pts)
+        
+        overlay_img = np.zeros((self.side_h, self.side_w, 3), dtype=np.uint8)
+        overlay_img[..., 1] = src_img
+        overlay_img[..., 2] = tgt_img
+        
+        img_output_path = os.path.join(self.log_dir, f"{self.base_filename}_{suffix}_overlay.png")
+        cv2.imwrite(img_output_path, overlay_img)
+        print(f"   -> Saved: {img_output_path}")
+
+    def write_execution_log(self, args, is_success, timestamp, process_time, best_height, best_score, icp_fitness, icp_rmse, tilt_params, T_final):
+        log_path = os.path.join(self.log_dir, f"{self.base_filename}_log.txt")
+        matrix_path = os.path.join(self.log_dir, f"{self.base_filename}_matrix.txt")
+        print(f":: Writing execution log: {log_path}")
+ 
+        with open(log_path, "w") as f:
+            f.write("=== Registration Log ===\n")
+            f.write(f"Timestamp     : {timestamp}\n")
+            f.write(f"Process Time  : {process_time}\n")
+            f.write(f"Source        : {args.source}\n")
+            f.write(f"Target        : {args.target}\n")
+            f.write(f"Status        : {'SUCCESS' if is_success else 'FAILED'}\n\n")
+            f.write("--- Parameters ---\n")
+            for key, val in vars(args).items():
+                f.write(f"{key:<25}: {val}\n")
+            
+            if is_success:
+                f.write("\n--- Results ---\n")
+                f.write(f"Best height slice : {best_height:.1f}m\n")
+                f.write(f"ORB score         : {best_score:.2f}px\n")
+                f.write(f"ICP fitness       : {icp_fitness:.2f}\n")
+                f.write(f"ICP RMSE          : {icp_rmse:.4f}m\n")
+                if tilt_params:
+                    a, b, c = tilt_params
+                    f.write(f"Tilt parameters   : a={a:.6f}, b={b:.6f}, c={c:.4f}\n")
+                f.write(f"Matrix file       : {os.path.basename(matrix_path)}\n")
+        print(f"   -> Saved: {log_path}")
+
+        if is_success and T_final is not None:
+            np.savetxt(matrix_path, T_final, fmt="%.10f", delimiter=",")
+            print(f"   -> Saved: {matrix_path}")
+            
+
+def registration_main():
+    parser = argparse.ArgumentParser(description="ORB-based LAS point cloud registration with ICP refinement")
+
+    # --- Input / Output ---
+    parser.add_argument("source", help="Source LAS file path")
+    parser.add_argument("target", help="Target LAS file path")
+    parser.add_argument("--out_dir", type=str, default=None, help="Output subdirectory inside results/")
+
+    # --- Preprocessing ---
+    parser.add_argument("--voxel_size", type=float, default=0.005, help="Voxel downsampling size in meters (default: 0.005)")
+    parser.add_argument("--pixel_size", type=float, default=0.045, help="Projection resolution in meters/pixel (default: 0.045)")
+    parser.add_argument("--overlap_threshold", type=float, default=1.0, help="XY distance threshold for overlap extraction in meters (default: 1.0)")
+
+    # --- CSF-based ground filtering ---
+    parser.add_argument("--csf_cloth_res", type=float, default=1.0, help="CSF cloth resolution (default: 1.0)")
+    parser.add_argument("--csf_rigidness", type=int, default=3, help="CSF rigidness parameter (default: 3)")
+    parser.add_argument("--csf_class_threshold", type=float, default=0.5, help="CSF classification threshold (default: 0.5)")
+
+    # --- Height slice search ---
+    parser.add_argument("--slice_h_min", type=float, default=0.7, help="Minimum height of slice search range in meters (default: 0.7)")
+    parser.add_argument("--slice_h_max", type=float, default=2.5, help="Maximum height of slice search range in meters (default: 2.5)")
+    parser.add_argument("--slice_step", type=float, default=0.2, help="Step size for height slice search in meters (default: 0.2)")
+    parser.add_argument("--slice_thickness", type=float, default=0.2, help="Thickness of each height slice in meters (default: 0.2)")
+
+    # --- ORB-based registration ---
+    parser.add_argument("--orb_nfeatures", type=int, default=5000, help="Number of ORB features to detect (default: 5000)")
+    parser.add_argument("--ransac_iter", type=int, default=10000, help="Number of RANSAC iterations (default: 10000)")
+    parser.add_argument("--ransac_threshold", type=float, default=3.0, help="RANSAC inlier threshold in pixels (default: 3.0)")
+    parser.add_argument("--min_inliers", type=int, default=10, help="Minimum inlier count to accept an ORB match (default: 10)")
+    parser.add_argument("--lowe_ratio", type=float, default=0.75, help="Lowe's ratio test threshold for ORB matching (default: 0.75)")
+
+    # --- 2DICP-based registration ---
+    parser.add_argument("--icp_threshold_factor", type=float, default=0.75, help="ICP threshold = pixel_size * this factor (default: 0.75)")
+    parser.add_argument("--icp_max_iter", type=int, default=2000, help="Maximum ICP iterations (default: 2000)")
+    parser.add_argument("--icp_relative_fitness", type=float, default=1e-6, help="ICP convergence criterion: relative fitness (default: 1e-6)")
+    parser.add_argument("--icp_relative_rmse", type=float, default=1e-6, help="ICP convergence criterion: relative RMSE (default: 1e-6)")
+    
+    # --- Log ---
+    parser.add_argument("--no_log", action="store_true", help="Suppress all intermediate and final image/log outputs (default: outputs enabled)")
+    
+    args = parser.parse_args()
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d")
+    start_time = datetime.datetime.now()
+
+    output_dir = os.path.join(f"results", args.out_dir) if args.out_dir else f"results/{timestamp}"
     os.makedirs(output_dir, exist_ok=True)
+
+    max_index = 0
+    for entry in os.listdir(output_dir):
+        match = re.match(r'^r(\d+)', entry)
+        if match:
+            try:
+                idx = int(match.group(1))
+                if idx > max_index:
+                    max_index = idx
+            except ValueError:
+                pass
+
+    new_index = max_index + 1
+    log_dir = os.path.join(output_dir, f"r{new_index}_log")
+    os.makedirs(log_dir, exist_ok=True)
+    output_las_path = os.path.join(output_dir, f"r{new_index}.las")
+    base_filename = f"r{new_index}"
     print(f":: Output directory: {os.path.abspath(output_dir)}")
 
+    registrator = AutoRegistrator(args.voxel_size, resolution=args.pixel_size)
 
-    source_name = os.path.splitext(os.path.basename(args.source))[0]
-    target_name = os.path.splitext(os.path.basename(args.target))[0]
-    base_filename = f"{source_name}_reg_to_{target_name}"
-    final_las_path = os.path.join(output_dir, f"{base_filename}.las")
-    
-    # GlobalRegistrationの初期化時にピクセル解像度を渡す
-    gr = GlobalRegistration(args.voxel_size, resolution=args.pixel_size)
+    src_pcd, SRC_las = registrator.load_las(args.source, keep_raw=False)
+    tgt_pcd, _ = registrator.load_las(args.target, keep_raw=False)
 
-    # 1. データの読み込み
-    pcd_s, raw_las_s = gr.load_las_no_transform(args.source, keep_raw=False)
-    pcd_t, _         = gr.load_las_no_transform(args.target, keep_raw=False)
+    src_pcd_ov, tgt_pcd_ov = registrator.extract_overlap(src_pcd, tgt_pcd, threshold=args.overlap_threshold)
 
-    # 2. 地理的重複領域の抽出
-    pcd_s_ov, pcd_t_ov = gr.extract_overlap_region(pcd_s, pcd_t, threshold=1.0)
-    
-    # 3. 地面除去 (CSF)
-    print(":: Filtering ground with CSF...")
-    s_ground, s_nonground = gr.filter_ground_csf(pcd_s_ov)
-    t_ground, t_nonground = gr.filter_ground_csf(pcd_t_ov)
+    src_ground, src_nonground = registrator.filter_ground(
+        src_pcd_ov,
+        cloth_resolution=args.csf_cloth_res,
+        rigidness=args.csf_rigidness,
+        class_threshold=args.csf_class_threshold
+    )
+    tgt_ground, tgt_nonground = registrator.filter_ground(
+        tgt_pcd_ov,
+        cloth_resolution=args.csf_cloth_res,
+        rigidness=args.csf_rigidness,
+        class_threshold=args.csf_class_threshold
+    )
 
-    # --- 最適なスライスの探索ループ ---
     best_score = float('inf')
     best_M = np.eye(3)
     best_height = 0.0
-    
-    height_slice_thickness = 0.2
-    search_ranges = np.arange(0.7, 2.5, 0.2)
 
-    print(f":: Searching best height slice ({len(search_ranges)} steps)...")
+    search_ranges = np.arange(args.slice_h_min, args.slice_h_max, args.slice_step)
+    print(f":: Searching best height slice for ORB matching ({len(search_ranges)} steps)")
 
     for h in search_ranges:
-        s_slice = gr.extract_slice(s_nonground, s_ground, h, h + height_slice_thickness)
-        t_slice = gr.extract_slice(t_nonground, t_ground, h, h + height_slice_thickness)
-        
-        img_s, img_t = gr.pcd_to_image(s_slice, t_slice)
-        
-        # 4. ORB位置合わせ (Rigid with Fixed Scale)
-        M_cand, inliers = gr.align_rigid_orb(img_s, img_t)
-        
-        if inliers > 10:
-            score = gr.evaluate_mean(img_s, img_t, M_cand)
-            print(f"   H={h:.1f}m: Error={score:.2f} px, Inliers={inliers}")
-            
+        src_slice = registrator.extract_slice(src_nonground, src_ground, h, h + args.slice_thickness)
+        tgt_slice = registrator.extract_slice(tgt_nonground, tgt_ground, h, h + args.slice_thickness)
+
+        src_img, tgt_img = registrator.project_to_image(src_slice, tgt_slice)
+
+        M_cand, inliers = registrator.register_with_ORB(
+            src_img, tgt_img,
+            orb_nfeatures=args.orb_nfeatures,
+            ransac_iter=args.ransac_iter,
+            ransac_threshold=args.ransac_threshold,
+            lowe_ratio=args.lowe_ratio
+        )
+
+        if inliers > args.min_inliers:
+            score = registrator.calculate_mean(src_img, tgt_img, M_cand)
+            print(f"   H={h:.1f}m: error={score:.2f}px, inliers={inliers}")
             if score < best_score:
                 best_score = score
                 best_M = M_cand
                 best_height = h
         else:
-            print(f"   H={h:.1f}m: Not enough matches.")
+            print(f"   H={h:.1f}m: not enough matches ({inliers}), skipping")
 
-    print(f"\n:: Best Result -> Height: {best_height:.1f}m, Error: {best_score:.2f}")
-    
-    # 5. 最終的な適用と保存
-    print(":: Applying transform to full resolution cloud...")
-    
-    raw_points = np.vstack((raw_las_s.x, raw_las_s.y, raw_las_s.z)).T
-    pcd_full = o3d.geometry.PointCloud()
-    pcd_full.points = o3d.utility.Vector3dVector(raw_points)
-    
-    # (A) XY平面の剛体変換適用 (ORB結果)
-    print(":: Applying ORB Initial Alignment...")
-    pcd_full_aligned = gr.apply_rigid_transform(pcd_full, best_M)
-    
-    # 地面点群（チルト計算用）と非地面点群（ICP用）にもORB結果を適用
-    s_ground_aligned = gr.apply_rigid_transform(s_ground, best_M)
-    s_nonground_aligned = gr.apply_rigid_transform(s_nonground, best_M)
+    is_success = best_score != float('inf')
 
-    # (A-2) ICPによる微調整処理 (New Feature)
-    # ORB結果で位置合わせされた点群から、再度ベストスライスを抽出
-    s_slice_aligned = gr.extract_slice(s_nonground_aligned, s_ground_aligned, best_height, best_height + height_slice_thickness)
-    t_slice_ref = gr.extract_slice(t_nonground, t_ground, best_height, best_height + height_slice_thickness)
-    
-    # ICPのしきい値は解像度の5倍程度を目安に設定 (例: 10cm解像度なら50cmまで許容して吸着)
-    icp_threshold = args.pixel_size * 0.75
-    M_icp_4x4 = gr.align_fine_icp(s_slice_aligned, t_slice_ref, threshold=icp_threshold)
-    
-    # ICPの結果を全体と地面点群に適用
-    pcd_full_aligned.transform(M_icp_4x4)
-    s_ground_aligned.transform(M_icp_4x4)
+    if not is_success:
+        print("\n!! Registration FAILED: no valid ORB matches found")
+        T_final = np.eye(4)
+    else:
+        print(f"\n   -> Best slice: H={best_height:.1f}m, score={best_score:.2f}px")
 
-    # (B) Z軸の最適化 (Tilt & Shift)
-    # ICP補正後の地面点群を使ってチルトを計算
-    a, b, c = gr.calculate_tilt_and_shift(s_ground_aligned, t_ground)
-    
-    pts_final = np.asarray(pcd_full_aligned.points)
-    z_adjustment = (a * pts_final[:, 0]) + (b * pts_final[:, 1]) + c
-    pts_final[:, 2] += z_adjustment
+        print(":: Applying ORB transform to full-resolution cloud")
+        SRC_pts = np.vstack((SRC_las.x, SRC_las.y, SRC_las.z)).T
+        SRC_pcd = o3d.geometry.PointCloud()
+        SRC_pcd.points = o3d.utility.Vector3dVector(SRC_pts)
 
-    # 保存
-    gr.save_aligned_las(final_las_path, raw_las_s, pts_final)
+        SRC_aligned, T_orb = registrator.apply_transform(SRC_pcd, best_M)
+        src_ground_aligned, _ = registrator.apply_transform(src_ground, best_M)
+        src_nonground_aligned, _ = registrator.apply_transform(src_nonground, best_M)
+        print(f"   -> ORB transform applied to {len(SRC_pts)} points")
 
-    # ---------------------------------------------------------
-    # 画像による位置合わせ確認 (Overlay Image Output)
-    # ---------------------------------------------------------
-    print(":: Generating result overlay image...")
-    
-    pcd_final_vis = o3d.geometry.PointCloud()
-    pcd_final_vis.points = o3d.utility.Vector3dVector(pts_final)
+        src_slice_aligned = registrator.extract_slice(
+            src_nonground_aligned, src_ground_aligned,
+            best_height, best_height + args.slice_thickness
+        )
+        tgt_slice_ref = registrator.extract_slice(
+            tgt_nonground, tgt_ground,
+            best_height, best_height + args.slice_thickness
+        )
 
-    # 確認用画像生成のため、最終結果から再度CSFとスライス
-    # (すでに位置合わせ済みなのでそのまま抽出)
-    s_ground_final, s_nonground_final = gr.filter_ground_csf(pcd_final_vis)
-    s_slice_final = gr.extract_slice(s_nonground_final, s_ground_final, best_height, best_height + height_slice_thickness)
-    
-    # ターゲット側のスライスは元のものを使用
-    t_slice_final = gr.extract_slice(t_nonground, t_ground, best_height, best_height + height_slice_thickness)
+        icp_threshold = args.pixel_size * args.icp_threshold_factor
+        M_icp_4x4, icp_fitness, icp_rmse = registrator.register_with_2DICP(
+            src_slice_aligned, tgt_slice_ref,
+            threshold=icp_threshold,
+            max_iteration=args.icp_max_iter,
+            relative_fitness=args.icp_relative_fitness,
+            relative_rmse=args.icp_relative_rmse
+        )
+        SRC_aligned.transform(M_icp_4x4)
+        src_ground_aligned.transform(M_icp_4x4)
 
-    # 既存の min_xy と 計算済み img_w/h を使って投影
-    img_s_final, img_t_final = gr.pcd_to_image(s_slice_final, t_slice_final)
+        print(":: Estimating Z tilt and shift from ground planes")
+        a, b, c = registrator.estimate_tilt_shift(src_ground_aligned, tgt_ground)
 
-    h_img, w_img = img_t_final.shape
-    overlay_img = np.zeros((h_img, w_img, 3), dtype=np.uint8)
-    overlay_img[..., 1] = img_s_final 
-    overlay_img[..., 2] = img_t_final 
+        T_z = np.eye(4)
+        T_z[2, 0] = a
+        T_z[2, 1] = b
+        T_z[2, 3] = c
 
-    img_output_path = os.path.join(output_dir, f"{base_filename}_overlay.png")
-    cv2.imwrite(img_output_path, overlay_img)
-    print(f"[Saved Image] {img_output_path}")
-    
+        SRC_pts = np.asarray(SRC_aligned.points)
+        SRC_pts[:, 2] += (a * SRC_pts[:, 0]) + (b * SRC_pts[:, 1]) + c
 
+        registrator.save_las(output_las_path, SRC_las, SRC_pts)
+        end_time = datetime.datetime.now()
+        process_time =  end_time - start_time
+
+    if not args.no_log:
+        print(":: Generating result overlay images and logs")
+ 
+        exporter = RegistrationExporter(log_dir, base_filename, args.pixel_size)
+
+        vis_height = best_height if is_success else 1.0
+        src_ground_original = copy.deepcopy(src_ground)
+        src_nonground_original = copy.deepcopy(src_nonground)
+ 
+        src_slice_original = registrator.extract_slice(
+            src_nonground_original, src_ground_original,
+            vis_height, vis_height + args.slice_thickness
+        )
+        tgt_slice_final = registrator.extract_slice(
+            tgt_nonground, tgt_ground,
+            vis_height, vis_height + args.slice_thickness
+        )
+
+        exporter.save_slice_overlay(src_slice_original, tgt_slice_final, registrator, "01_original")
+        
+        src_slice_ORB = src_slice_original.transform(T_orb)
+        exporter.save_slice_overlay(src_slice_ORB, tgt_slice_final, registrator, "02_ORB")
+        
+        src_slice_2DICP = src_slice_ORB.transform(M_icp_4x4)
+        exporter.save_slice_overlay(src_slice_2DICP, tgt_slice_final, registrator, "03_ICP")
+
+        exporter.save_ground_side_overlay(src_ground, tgt_ground, "04_original_ground")
+        
+        T_final = T_z @ M_icp_4x4 @ T_orb
+        src_ground_final = copy.deepcopy(src_ground).transform(T_final)
+        exporter.save_ground_side_overlay(src_ground_final, tgt_ground, "05_shifted_ground")
+
+        tilt_params = (a, b, c) if is_success else None
+        exporter.write_execution_log(
+            args, is_success, timestamp, 
+            process_time, best_height, 
+            best_score, icp_fitness, 
+            icp_rmse, tilt_params, 
+            T_final)
+               
 if __name__ == "__main__":
-    main()
+    registration_main()

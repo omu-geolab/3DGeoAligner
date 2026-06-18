@@ -1,6 +1,10 @@
+"""
+Automatic georeferencing of LAS point clouds
+"""
+
 import argparse
 import numpy as np
-import laspy
+import laspy as lp
 from pyproj import CRS, Transformer
 import geopandas as gpd
 import cv2
@@ -10,30 +14,27 @@ from shapely.geometry import box, LineString, MultiLineString, Polygon, MultiPol
 from scipy.spatial import cKDTree
 from scipy.interpolate import RegularGridInterpolator
 import os
-import sys
 import datetime
 import rasterio
 from scipy.interpolate import NearestNDInterpolator
 
-class AutoGeoreferencer:
-    def __init__(self, pixel_size=0.1):
-        self.pixel_size = pixel_size
-        self.min_x = 0
-        self.max_y = 0
-        self.img_width = 0
-        self.img_height = 0
 
-    # -------------------------------------------------------------------------
-    # 1. LASデータの読み込み
-    # -------------------------------------------------------------------------
+class AutoGeoreferencer:
+    """Executes automatic georeferencing of LAS point clouds."""
+    def __init__(self, pixel_size):
+        self.pixel_size  = pixel_size
+        self.grid_min_x  = 0
+        self.grid_max_y  = 0
+        self.img_width   = 0
+        self.img_height  = 0
+
     def load_las(self, path):
         print(f":: Loading LAS file: {path}")
         if not os.path.exists(path):
             print(f"!! Error: File not found -> {path}")
             return None, None
-
         try:
-            las = laspy.read(path)
+            las = lp.read(path)
         except Exception as e:
             print(f"!! Error reading LAS: {e}")
             return None, None
@@ -41,440 +42,453 @@ class AutoGeoreferencer:
         points = np.vstack((las.x, las.y, las.z)).T
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
-        
-        return las, pcd
+        return pcd, las
 
-    # -------------------------------------------------------------------------
-    # LASデータの座標系変換
-    # -------------------------------------------------------------------------
-    def convert_las_crs(self, las_data, pcd, src_epsg, target_crs):
-        print(f":: Converting LAS coordinates from EPSG:{src_epsg} to Target CRS ({target_crs.name})...")
-        
+    def convert_crs(self, las_data, pcd, src_crs, tgt_crs, target_scale=0.001):
+        print(f":: Converting LAS coordinates from {src_crs.name} to {tgt_crs.name}")
         try:
-            transformer = Transformer.from_crs(CRS.from_epsg(src_epsg), target_crs, always_xy=True)
+            crs_transformer = Transformer.from_crs(src_crs, tgt_crs, always_xy=True)
         except Exception as e:
             print(f"!! Error creating CRS transformer: {e}")
             return None, None
-        
-        new_x, new_y = transformer.transform(las_data.x, las_data.y)
-        original_z = las_data.z.copy()
+
+        new_x, new_y = crs_transformer.transform(las_data.x, las_data.y)
+        original_z   = las_data.z.copy()
 
         las_data.header.offsets = np.array([np.min(new_x), np.min(new_y), np.min(original_z)])
-        las_data.header.scales = np.array([0.001, 0.001, 0.001])
-        
+        las_data.header.scales  = np.array([target_scale, target_scale, target_scale])
         las_data.x = new_x
         las_data.y = new_y
         las_data.z = original_z
-        
-        points = np.vstack((new_x, new_y, original_z)).T
-        pcd.points = o3d.utility.Vector3dVector(points)
-        
-        print("   -> Conversion complete. LAS data is now in Target CRS.")
+
+        pcd.points = o3d.utility.Vector3dVector(np.vstack((new_x, new_y, original_z)).T)
         return las_data, pcd
 
-    # -------------------------------------------------------------------------
-    # 2. グリッド設定
-    # -------------------------------------------------------------------------
-    def setup_grid(self, las_data, buffer=20.0):
-        x_min = np.min(las_data.x)
-        x_max = np.max(las_data.x)
-        y_min = np.min(las_data.y)
-        y_max = np.max(las_data.y)
+    def setup_grid(self, las_data, buffer):
+        las_x_min, las_x_max = np.min(las_data.x), np.max(las_data.x)
+        las_y_min, las_y_max = np.min(las_data.y), np.max(las_data.y)
 
-        self.min_x = x_min - buffer
-        max_x = x_max + buffer
-        min_y = y_min - buffer
-        self.max_y = y_max + buffer 
+        self.grid_min_x = las_x_min - buffer
+        grid_max_x      = las_x_max + buffer
+        grid_min_y      = las_y_min - buffer
+        self.grid_max_y = las_y_max + buffer
 
-        width_m = max_x - self.min_x
-        height_m = self.max_y - min_y
+        self.img_width  = int(np.ceil((grid_max_x - self.grid_min_x) / self.pixel_size))
+        self.img_height = int(np.ceil((self.grid_max_y - grid_min_y)  / self.pixel_size))
 
-        self.img_width = int(np.ceil(width_m / self.pixel_size))
-        self.img_height = int(np.ceil(height_m / self.pixel_size))
-        
-        print(f"   [Grid Info] Size: {self.img_width} x {self.img_height} px (Resolution: {self.pixel_size}m/px)")
-        
-        return box(self.min_x, min_y, max_x, self.max_y)
+        print(f"   -> [Grid] {self.img_width} x {self.img_height} px  ({self.pixel_size} m/px)")
+        return box(self.grid_min_x, grid_min_y, grid_max_x, self.grid_max_y)
 
     def world_to_pixel(self, x, y):
-        px = (x - self.min_x) / self.pixel_size
-        py = (self.max_y - y) / self.pixel_size
+        px = (x - self.grid_min_x) / self.pixel_size
+        py = (self.grid_max_y - y) / self.pixel_size
         return px.astype(np.int32), py.astype(np.int32)
 
-    # -------------------------------------------------------------------------
-    # 3. SHPファイルの処理
-    # -------------------------------------------------------------------------
-    def process_shp(self, gdf, bbox_poly):
-        print(f":: Processing Shapefile features...")
+    def rasterize_shp(self, gdf, grid_bbox, line_thickness):
+        print(":: Processing Shapefile features")
         try:
-            sindex = gdf.sindex
-            possible_matches_index = list(sindex.intersection(bbox_poly.bounds))
-            gdf_sub = gdf.iloc[possible_matches_index]
-            clipped_gdf = gdf_sub.clip(bbox_poly)
+            candidate_indices = list(gdf.sindex.intersection(grid_bbox.bounds))
+            clipped_gdf = gdf.iloc[candidate_indices].clip(grid_bbox)
         except Exception as e:
             print(f"!! Error clipping Shapefile: {e}")
             return None
 
         if len(clipped_gdf) == 0:
-            print("!! ERROR: No road features found in the specified LAS area.")
+            print("!! ERROR: No road features found in the LAS area")
             return None
 
-        img = np.zeros((self.img_height, self.img_width), dtype=np.uint8)
-        
+        shp_img = np.zeros((self.img_height, self.img_width), dtype=np.uint8)
+
         for geom in clipped_gdf.geometry:
-            draw_lines = []
-            if isinstance(geom, (LineString, MultiLineString)):
-                if isinstance(geom, LineString): draw_lines.append(geom)
-                else: draw_lines.extend(geom.geoms)
-            elif isinstance(geom, (Polygon, MultiPolygon)):
-                if isinstance(geom, Polygon): draw_lines.append(geom.boundary)
-                else: 
-                    for poly in geom.geoms: draw_lines.append(poly.boundary)
+            line_geometries = []
+            if isinstance(geom, LineString):
+                line_geometries.append(geom)
+            elif isinstance(geom, MultiLineString):
+                line_geometries.extend(geom.geoms)
+            elif isinstance(geom, Polygon):
+                line_geometries.append(geom.boundary)
+            elif isinstance(geom, MultiPolygon):
+                for poly in geom.geoms:
+                    line_geometries.append(poly.boundary)
 
-            for line in draw_lines:
-                if line.is_empty: continue
-                xs, ys = line.xy
+            for line_geom in line_geometries:
+                if line_geom.is_empty:
+                    continue
+                xs, ys = line_geom.xy
                 px, py = self.world_to_pixel(np.array(xs), np.array(ys))
-                
                 if np.any((px >= 0) & (px < self.img_width) & (py >= 0) & (py < self.img_height)):
-                    pts = np.column_stack([px, py])
-                    cv2.polylines(img, [pts], isClosed=False, color=255, thickness=3)
-            
-        return img
+                    cv2.polylines(shp_img, [np.column_stack([px, py])], isClosed=False, color=255, thickness=line_thickness)
 
-    # -------------------------------------------------------------------------
-    # 4. 点群スライス画像化
-    # -------------------------------------------------------------------------
-    def process_las_slice(self, pcd, h_min=1.0, h_max=1.5):
-        print(":: Filtering ground (CSF) and slicing walls...")
+        return shp_img
+
+    def rasterize_las_slice(self, pcd, cloth_resolution, rigidness, class_threshold, h_min, h_max, dilate_iter, close_kernel):
+        print(":: Filtering ground (CSF) and slicing walls")
         csf = CSF.CSF()
-        csf.params.cloth_resolution = 1.0
-        csf.params.class_threshold = 0.5
+        csf.params.cloth_resolution = cloth_resolution
+        csf.params.rigidness = rigidness
+        csf.params.class_threshold  = class_threshold
         csf.setPointCloud(np.asarray(pcd.points))
-        ground_idx = CSF.VecInt()
-        non_ground_idx = CSF.VecInt()
-        csf.do_filtering(ground_idx, non_ground_idx)
-        
-        ground = pcd.select_by_index(list(ground_idx))
-        non_ground = pcd.select_by_index(list(non_ground_idx))
+        ground_idx     = CSF.VecInt()
+        nonground_idx  = CSF.VecInt()
+        csf.do_filtering(ground_idx, nonground_idx)
 
-        g_pts = np.asarray(ground.points)
-        ng_pts = np.asarray(non_ground.points)
-        
-        if len(g_pts) == 0:
+        ground    = pcd.select_by_index(list(ground_idx))
+        nonground = pcd.select_by_index(list(nonground_idx))
+
+        ground_pts    = np.asarray(ground.points)
+        nonground_pts = np.asarray(nonground.points)
+
+        if len(ground_pts) == 0:
             return None
 
-        tree = cKDTree(g_pts[:, :2])
-        _, idx = tree.query(ng_pts[:, :2], k=1)
-        ground_z = g_pts[idx, 2]
-        rel_z = ng_pts[:, 2] - ground_z
+        tree = cKDTree(ground_pts[:, :2])
+        _, idx = tree.query(nonground_pts[:, :2], k=1)
+        ground_z = ground_pts[idx, 2]
+        rel_z = nonground_pts[:, 2] - ground_z
         
         mask = (rel_z >= h_min) & (rel_z < h_max)
-        sliced_points = ng_pts[mask]
-        
-        if len(sliced_points) == 0:
+        slice_pts = nonground_pts[mask]
+
+        if len(slice_pts) == 0:
             return None
 
-        img = np.zeros((self.img_height, self.img_width), dtype=np.uint8)
-        px, py = self.world_to_pixel(sliced_points[:, 0], sliced_points[:, 1])
-        
-        valid = (px >= 0) & (px < self.img_width) & (py >= 0) & (py < self.img_height)
-        img[py[valid], px[valid]] = 255
-        
-        img = cv2.dilate(img, np.ones((3,3), np.uint8), iterations=1)
-        kernel_close = np.ones((7, 7), np.uint8) 
-        img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel_close)
-        
-        return img
+        las_img = np.zeros((self.img_height, self.img_width), dtype=np.uint8)
+        px, py  = self.world_to_pixel(slice_pts[:, 0], slice_pts[:, 1])
+        valid   = (px >= 0) & (px < self.img_width) & (py >= 0) & (py < self.img_height)
+        las_img[py[valid], px[valid]] = 255
 
-    # -------------------------------------------------------------------------
-    # 5. 位置合わせ計算
-    # -------------------------------------------------------------------------
-    def calculate_transform(self, img_las, img_shp):
-        print(":: Computing alignment...")
-        img_las_blur = cv2.GaussianBlur(img_las, (5, 5), 0)
-        dist_transform = cv2.distanceTransform(255 - img_shp, cv2.DIST_L2, 5)
-        dist_img = 1.0 / (1.0 + dist_transform * 0.1) 
-        img_shp_score = cv2.normalize(dist_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        las_img = cv2.dilate(las_img, np.ones((3, 3), np.uint8), iterations=dilate_iter)
+        las_img = cv2.morphologyEx(las_img, cv2.MORPH_CLOSE, np.ones((close_kernel, close_kernel), np.uint8))
+        return las_img
 
-        search_range_m = 5.0 
-        pad_px = int(np.ceil(search_range_m / self.pixel_size))
-        
-        img_shp_padded = cv2.copyMakeBorder(
-            img_shp_score, pad_px, pad_px, pad_px, pad_px, cv2.BORDER_CONSTANT, value=0
-        )
+    def estimate_transform(self, las_img, shp_img, alpha, search_range_m, angle_min, angle_max, angle_step, min_score):
+        print(":: Computing alignment")
+        las_img_blur   = cv2.GaussianBlur(las_img, (5, 5), 0)
+        dist_img       = 1.0 / (1.0 + cv2.distanceTransform(255 - shp_img, cv2.DIST_L2, 5) * alpha)
+        shp_score_img  = cv2.normalize(dist_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        pad_px          = int(np.ceil(search_range_m / self.pixel_size))
+        shp_img_padded  = cv2.copyMakeBorder(shp_score_img, pad_px, pad_px, pad_px, pad_px, cv2.BORDER_CONSTANT, value=0)
 
         best_score = -1
         best_M = None
-        h, w = img_las.shape
+        h, w   = las_img.shape
         center = (w // 2, h // 2)
 
-        for angle in np.arange(-5.0, 5.25, 0.25):
-            M_rot = cv2.getRotationMatrix2D(center, angle, 1.0)
-            rotated_las = cv2.warpAffine(img_las_blur, M_rot, (w, h))
-            res = cv2.matchTemplate(img_shp_padded, rotated_las, cv2.TM_CCORR_NORMED)
-            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        for angle in np.arange(angle_min, angle_max + angle_step * 0.5, angle_step):
+            rot_matrix    = cv2.getRotationMatrix2D(center, angle, 1.0)
+            rotated       = cv2.warpAffine(las_img_blur, rot_matrix, (w, h))
+            match_result  = cv2.matchTemplate(shp_img_padded, rotated, cv2.TM_CCORR_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(match_result)
 
             if max_val > best_score:
-                best_score = max_val
+                best_score     = max_val
                 dx = max_loc[0] - pad_px
                 dy = max_loc[1] - pad_px
-                M_best_candidate = M_rot.copy()
-                M_best_candidate[0, 2] += dx
-                M_best_candidate[1, 2] += dy
-                best_M = M_best_candidate
+                candidate_matrix = rot_matrix.copy()
+                candidate_matrix[0, 2] += dx
+                candidate_matrix[1, 2] += dy
+                best_M = candidate_matrix
 
-        if best_M is None or best_score < 0.15:
-            print(f"!! Alignment score too low or failed (Score: {best_score:.4f}).")
+        if best_M is None or best_score < min_score:
+            print(f"!! Alignment score too low or failed (Score: {best_score:.4f})")
             return None
 
         print(f"   -> Best Match Score: {best_score:.4f}")
         return best_M
 
-    def apply_xy_transform_memory(self, las_data, M_pixel):
-        print(":: Applying affine transformation (XY) to LAS coordinates...")
-        coords = np.vstack((las_data.x, las_data.y))
-        px = (coords[0] - self.min_x) / self.pixel_size
-        py = (self.max_y - coords[1]) / self.pixel_size
-        ones = np.ones(coords.shape[1])
-        p_coords = np.vstack((px, py, ones))
-        trans_p_coords = M_pixel @ p_coords
-        px_new = trans_p_coords[0]
-        py_new = trans_p_coords[1]
-        las_data.x = px_new * self.pixel_size + self.min_x
-        las_data.y = self.max_y - py_new * self.pixel_size
+    def apply_xy_transform(self, las_data, transform_matrix):
+        print(":: Applying affine transformation (XY) to LAS coordinates")
+        px    = (las_data.x - self.grid_min_x) / self.pixel_size
+        py    = (self.grid_max_y - las_data.y)  / self.pixel_size
+        ones  = np.ones(len(px))
+        transformed_pixels = transform_matrix @ np.vstack((px, py, ones))
+        las_data.x = transformed_pixels[0] * self.pixel_size + self.grid_min_x
+        las_data.y = self.grid_max_y - transformed_pixels[1] * self.pixel_size
         return las_data
 
-    # -------------------------------------------------------------------------
-    # 7. 【改】DEMによる滑らかなローカルZ座標補正
-    # -------------------------------------------------------------------------
-    def align_z_smoothly(self, las_data, dem_path, current_crs, smooth_kernel_size=51):
-        """
-        DEMとの差分グリッドを作成し、ガウスぼかしを適用して滑らかな補正曲面を作る。
-        """
-        print(f":: Starting Smooth Z-alignment using DEM: {dem_path}")
-        
+    def align_z_with_dem(self, las_data, dem_path, current_crs, smooth_kernel_size, grid_res, max_ground_samples, dem_valid_min=-1000, dem_valid_max=4000):
+        print(f":: Starting smooth Z-alignment using DEM: {dem_path}")
+
         if not os.path.exists(dem_path):
-            print("!! Error: DEM file not found.")
-            return
+            print("!! Error: DEM file not found")
+            return None, None, None
 
-        # 1. LASの範囲確認
-        x_min, x_max = np.min(las_data.x), np.max(las_data.x)
-        y_min, y_max = np.min(las_data.y), np.max(las_data.y)
+        las_x_min, las_x_max = np.min(las_data.x), np.max(las_data.x)
+        las_y_min, las_y_max = np.min(las_data.y), np.max(las_data.y)
 
-        # 2. 地面点を抽出 (CSF)
-        print("   -> Detecting ground points for difference calculation...")
-        # 処理速度のため、最大10万点程度にサンプリング
-        points = np.vstack((las_data.x, las_data.y, las_data.z)).T
-        if len(points) > 200000:
-            indices = np.random.choice(len(points), 200000, replace=False)
-            sample_points = points[indices]
-        else:
-            sample_points = points
+        print("   -> Detecting ground points for difference calculation")
+        all_pts = np.vstack((las_data.x, las_data.y, las_data.z)).T
+        if len(all_pts) > max_ground_samples:
+            all_pts = all_pts[np.random.choice(len(all_pts), max_ground_samples, replace=False)]
 
         csf = CSF.CSF()
         csf.params.cloth_resolution = 1.0
-        csf.params.class_threshold = 0.5
-        csf.setPointCloud(np.asarray(sample_points))
-        ground_idx = CSF.VecInt()
-        non_ground_idx = CSF.VecInt()
-        csf.do_filtering(ground_idx, non_ground_idx)
-        
+        csf.params.class_threshold  = 0.5
+        csf.setPointCloud(np.asarray(all_pts))
+        ground_idx    = CSF.VecInt()
+        nonground_idx = CSF.VecInt()
+        csf.do_filtering(ground_idx, nonground_idx)
+
         if len(ground_idx) == 0:
-            print("!! Warning: No ground points found. Skipping Z-alignment.")
-            return
+            print("!! Warning: No ground points found. Skipping Z-alignment")
+            return None, None, None
 
-        g_pts = sample_points[ground_idx] # Ground Points (x, y, z_las)
+        ground_pts = all_pts[list(ground_idx)]
 
-        # 3. DEMから標高取得
-        print("   -> Sampling DEM heights...")
-        dem_z_vals = []
+        print("   -> Sampling DEM heights")
         try:
-            with rasterio.open(dem_path) as src:
-                # 座標変換が必要な場合
-                if current_crs != src.crs:
-                    transformer = Transformer.from_crs(current_crs, src.crs, always_xy=True)
-                    gx, gy = transformer.transform(g_pts[:, 0], g_pts[:, 1])
-                    sample_coords = list(zip(gx, gy))
+            with rasterio.open(dem_path) as dem_src:
+                if current_crs != dem_src.crs:
+                    crs_transformer = Transformer.from_crs(current_crs, dem_src.crs, always_xy=True)
+                    ground_x, ground_y = crs_transformer.transform(ground_pts[:, 0], ground_pts[:, 1])
                 else:
-                    sample_coords = list(zip(g_pts[:, 0], g_pts[:, 1]))
-
-                sampled = src.sample(sample_coords)
-                for val in sampled:
-                    dem_z_vals.append(val[0])
+                    ground_x, ground_y = ground_pts[:, 0], ground_pts[:, 1]
+                dem_z = np.array([v[0] for v in dem_src.sample(zip(ground_x, ground_y))])
         except Exception as e:
             print(f"!! Error reading DEM: {e}")
-            return
+            return None, None, None
 
-        dem_z_vals = np.array(dem_z_vals)
-        
-        # 無効値(-9999等)の除去
-        valid_mask = (dem_z_vals > -1000) & (dem_z_vals < 4000)
-        g_pts = g_pts[valid_mask]
-        dem_z_vals = dem_z_vals[valid_mask]
+        valid_dem  = (dem_z > dem_valid_min) & (dem_z < dem_valid_max)
+        ground_pts = ground_pts[valid_dem]
+        dem_z      = dem_z[valid_dem]
 
-        if len(g_pts) == 0:
-            return
+        if len(ground_pts) == 0:
+            print("!! Warning: No ground points found. Skipping Z-alignment")
+            return None, None, None
 
-        # 差分（補正量） = DEM - LAS
-        diffs = dem_z_vals - g_pts[:, 2]
+        z_diffs = dem_z - ground_pts[:, 2]
 
-        # 4. 補正量グリッドの作成 (2m解像度など少し粗くて良い)
-        grid_res = 2.0  # 2m grid
-        grid_w = int(np.ceil((x_max - x_min) / grid_res)) + 1
-        grid_h = int(np.ceil((y_max - y_min) / grid_res)) + 1
-        
-        print(f"   -> Creating adjustment grid ({grid_w}x{grid_h}) resolution={grid_res}m")
+        grid_w = int(np.ceil((las_x_max - las_x_min) / grid_res)) + 1
+        grid_h = int(np.ceil((las_y_max - las_y_min) / grid_res)) + 1
+        print(f"   -> Creating adjustment grid ({grid_w}x{grid_h}, {grid_res} m/cell)")
 
-        # グリッドの各セルに含まれる差分の平均を計算
-        # Accumulate sums and counts
-        grid_sum = np.zeros((grid_h, grid_w), dtype=np.float32)
+        grid_sum   = np.zeros((grid_h, grid_w), dtype=np.float32)
         grid_count = np.zeros((grid_h, grid_w), dtype=np.float32)
 
-        # 座標をインデックスに変換
-        idx_x = ((g_pts[:, 0] - x_min) / grid_res).astype(np.int32)
-        idx_y = ((y_max - g_pts[:, 1]) / grid_res).astype(np.int32) # Image coordinates (Top-down)
-
-        # 範囲チェック
+        idx_x     = ((ground_pts[:, 0] - las_x_min) / grid_res).astype(np.int32)
+        idx_y     = ((las_y_max - ground_pts[:, 1]) / grid_res).astype(np.int32)
         valid_idx = (idx_x >= 0) & (idx_x < grid_w) & (idx_y >= 0) & (idx_y < grid_h)
-        idx_x = idx_x[valid_idx]
-        idx_y = idx_y[valid_idx]
-        diffs = diffs[valid_idx]
 
-        np.add.at(grid_sum, (idx_y, idx_x), diffs)
-        np.add.at(grid_count, (idx_y, idx_x), 1)
+        np.add.at(grid_sum,   (idx_y[valid_idx], idx_x[valid_idx]), z_diffs[valid_idx])
+        np.add.at(grid_count, (idx_y[valid_idx], idx_x[valid_idx]), 1)
 
-        # 平均値の計算（データがないところはNaN）
         with np.errstate(divide='ignore', invalid='ignore'):
-            adjustment_grid = grid_sum / grid_count
+            z_adjustment_grid = grid_sum / grid_count
 
-        # # 5. 穴埋め (Inpainting) - データがない場所を埋める
-        # mask = np.isnan(adjustment_grid).astype(np.uint8) * 255
-        # # NaNを0にしてOpenCVで扱えるようにする
-        # adjustment_grid_fill = np.nan_to_num(adjustment_grid, nan=0.0).astype(np.float32)
-        
-        # # OpenCVのInpaintは8bitか16bit画像が必要だが、ここでは近似的に
-        # # navier-stokes等でなく、単純なモルフォロジーやresizeによる穴埋めを行う
-        # # 簡易的に、有効な値の平均で埋める（あるいはkNN）
-        # # ここでは「Nearest」で粗く埋めた後、Blurする
-        
-        # 有効な値のインデックス
         y_valid, x_valid = np.where(grid_count > 0)
         if len(y_valid) > 0:
-            # SciPyのNearestNDInterpolatorで穴埋め
-            points_valid = np.column_stack((x_valid, y_valid))
-            vals_valid = adjustment_grid[y_valid, x_valid]
-            interpolator = NearestNDInterpolator(points_valid, vals_valid)
-            
-            # 全グリッド座標
+            nn_interp = NearestNDInterpolator(
+                np.column_stack((x_valid, y_valid)), z_adjustment_grid[y_valid, x_valid])
             Y, X = np.mgrid[0:grid_h, 0:grid_w]
-            adjustment_grid_filled = interpolator((X, Y))
+            z_adjustment_grid = nn_interp((X, Y))
         else:
-            adjustment_grid_filled = np.zeros_like(adjustment_grid)
+            z_adjustment_grid = np.zeros_like(z_adjustment_grid)
 
-        # 6. 【重要】スムージング (Gaussian Blur)
-        # これが「がたがたにならない」ための肝。
-        # カーネルサイズを大きくすると、より緩やかになる
-        k_size = smooth_kernel_size | 1 # 奇数にする
-        print(f"   -> Smoothing adjustment grid (Kernel: {k_size}x{k_size})...")
-        smooth_adjustment = cv2.GaussianBlur(adjustment_grid_filled, (k_size, k_size), 0)
+        k_size = smooth_kernel_size | 1
+        print(f"   -> Smoothing adjustment grid (kernel: {k_size}x{k_size})")
+        smoothed_z_adjustment = cv2.GaussianBlur(z_adjustment_grid, (k_size, k_size), 0)
 
-        # 7. 全点への適用 (Bilinear Interpolation)
-        print("   -> Applying smooth Z adjustment to all points...")
-        
-        # RegularGridInterpolatorの準備
-        # grid座標系: x=0..w, y=0..h (yは画像座標なので上から下)
-        # adjustment_gridは [y, x]
-        # x_coords = np.arange(grid_w) * grid_res + x_min + grid_res/2
-        # y_coords = y_max - (np.arange(grid_h) * grid_res + grid_res/2)
-        
-        # 画像座標系(y=0がTop=MaxY)に合わせてInterpolateする
-        y_axis = np.arange(grid_h)
-        x_axis = np.arange(grid_w)
-        interp_func = RegularGridInterpolator((y_axis, x_axis), smooth_adjustment, bounds_error=False, fill_value=None)
+        ground_pts_before = ground_pts.copy()
+        print("   -> Applying smooth Z adjustment to all points")
+        grid_interp = RegularGridInterpolator((np.arange(grid_h), np.arange(grid_w)), smoothed_z_adjustment, bounds_error=False, fill_value=None)
+        all_x_idx = (las_data.x - las_x_min) / grid_res
+        all_y_idx = (las_y_max - las_data.y)  / grid_res
+        las_data.z += grid_interp(np.column_stack((all_y_idx, all_x_idx)))
+        print("   -> Z-alignment complete")
 
-        # LASの全点のグリッド座標を計算
-        all_x_idx = (las_data.x - x_min) / grid_res
-        all_y_idx = (y_max - las_data.y) / grid_res
-        
-        # 補正値を取得
-        # RegularGridInterpolator takes (y, x)
-        pts_for_interp = np.column_stack((all_y_idx, all_x_idx))
-        z_offsets = interp_func(pts_for_interp)
-        
-        # 適用
-        las_data.z += z_offsets
-        
-        print("   -> Z-alignment complete.")
-        return
+        ground_pts_after = ground_pts.copy()
+        ground_pts_after[:, 2] += grid_interp(np.column_stack(((las_y_max - ground_pts[:, 1]) / grid_res, (ground_pts[:, 0] - las_x_min) / grid_res)))
+        return ground_pts_before, ground_pts_after, dem_z
 
-    # -------------------------------------------------------------------------
-    # 8. ファイル保存
-    # -------------------------------------------------------------------------
-    def save_las(self, las_data, output_path, target_crs):
+    def save_las(self, las_data, output_path, tgt_crs, target_scale=0.001):
         print(f":: Saving LAS file -> {output_path}")
-        
-        new_header = laspy.LasHeader(point_format=las_data.header.point_format, version=las_data.header.version)
-        new_header.scales = np.array([0.001, 0.001, 0.001])
-        new_header.offsets = np.array([np.min(las_data.x), np.min(las_data.y), np.min(las_data.z)])
-
+        header = lp.LasHeader(point_format=las_data.header.point_format,version=las_data.header.version)
+        header.scales  = np.array([target_scale, target_scale, target_scale])
+        header.offsets = np.array([np.min(las_data.x), np.min(las_data.y), np.min(las_data.z)])
         try:
-            new_header.add_crs(target_crs)
+            header.add_crs(tgt_crs)
         except Exception:
             pass
 
-        new_las = laspy.LasData(new_header)
+        new_las = lp.LasData(header)
         new_las.x = las_data.x
         new_las.y = las_data.y
         new_las.z = las_data.z
 
-        for dim_name in las_data.point_format.dimension_names:
-            if dim_name not in ['X', 'Y', 'Z']:
+        for dim in las_data.point_format.dimension_names:
+            if dim not in ('X', 'Y', 'Z'):
                 try:
-                    new_las[dim_name] = las_data[dim_name]
+                    new_las[dim] = las_data[dim]
                 except Exception:
                     pass
 
         new_las.write(output_path)
-        print(":: Done.")
+        print(f"   -> Saved: {output_path}")
 
-    def save_result_overlay(self, img_las, img_shp, M, output_path="result_overlay.png"):
-        h, w = img_shp.shape
-        img_las_transformed = cv2.warpAffine(img_las, M, (w, h))
-        vis_img = np.zeros((h, w, 3), dtype=np.uint8)
-        vis_img[:, :, 2] = img_shp             
-        vis_img[:, :, 1] = img_las_transformed 
-        cv2.imwrite(output_path, vis_img)
+        
+class GeoreferencingExporter:
+    """Handles overlay image and log output for a georeferencing run."""
+    def __init__(self, log_dir, base_filename, pixel_size):
+        self.log_dir    = log_dir
+        self.base_filename = base_filename
+        self.pixel_size    = pixel_size
 
-# -------------------------------------------------------------------------
-# Main Execution
-# -------------------------------------------------------------------------
-def georeference_main():
-    parser = argparse.ArgumentParser(description="Auto Georeferencing LAS to SHP + DEM (Smooth)")
-    parser.add_argument("las_path", help="Input LAS file path")
-    parser.add_argument("shp_path", help="Reference Road Edge SHP file path")
-    parser.add_argument("dem_path",  help="Reference DEM GeoTIFF path")
-    parser.add_argument("--las_epsg", type=int, default="32653", help="Original EPSG code of LAS") #Scaniverseで取得した点群は EPSG:32653 (UTM53N)
-    parser.add_argument("--target_epsg", type=int, default=None, help="Force Target EPSG code")
-    parser.add_argument("--pixel_size", type=float, default=0.1, help="Pixel size in meters")
-    parser.add_argument("--smooth_kernel", type=int, default=51, help="Kernel size for Z smoothing (odd number)")
+    def save_overlay(self, las_img, shp_img, suffix, transform_matrix=np.eye(2,3)):
+        h, w = shp_img.shape
+        overlay = np.zeros((h, w, 3), dtype=np.uint8)
+        overlay[:, :, 2] = shp_img
+        overlay[:, :, 1] = cv2.warpAffine(las_img, transform_matrix, (w, h))
+        path = os.path.join(self.log_dir, f"{self.base_filename}_{suffix}_overlay.png")
+        cv2.imwrite(path, overlay)
+        print(f"   -> Saved: {path}")
     
+    def save_dem_ground_overlay(self, ground_pts, dem_z, suffix):
+        if ground_pts is None or dem_z is None or len(ground_pts) == 0:
+            print(f"!! Skipping DEM comparison image (no data): {suffix}")
+            return
+
+        all_x   = ground_pts[:, 0]
+        las_z   = ground_pts[:, 2]
+
+        x_min, x_max = all_x.min(),  all_x.max()
+        z_min = min(las_z.min(), dem_z.min()) - 1.0
+        z_max = max(las_z.max(), dem_z.max()) + 1.0
+
+        scale = 1.0 / self.pixel_size
+        w = max(int(np.ceil((x_max - x_min) * scale)) + 1, 1)
+        h = max(int(np.ceil((z_max - z_min) * scale)) + 1, 1)
+
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+
+        def plot_pts(xs, zs, channel):
+            x_px = ((xs - x_min) * scale).astype(np.int32)
+            z_px = ((zs - z_min) * scale).astype(np.int32)
+            valid = (x_px >= 0) & (x_px < w) & (z_px >= 0) & (z_px < h)
+            img[h - z_px[valid] - 1, x_px[valid], channel] = 255
+
+        plot_pts(all_x, dem_z, 2)
+
+        plot_pts(all_x, las_z, 1)
+
+        path = os.path.join(self.log_dir, f"{self.base_filename}_{suffix}.png")
+        cv2.imwrite(path, img)
+        print(f"   -> Saved: {path}")
+
+    def write_execution_log(self, args, timestamp, process_time, transform_matrix, tgt_epsg):
+        log_path    = os.path.join(self.log_dir, f"{self.base_filename}_log.txt")
+        matrix_path = os.path.join(self.log_dir, f"{self.base_filename}_matrix.txt")
+        print(f":: Writing execution log: {log_path}")
+
+        dx_m    = transform_matrix[0, 2] * args.pixel_size
+        dy_m    = transform_matrix[1, 2] * args.pixel_size
+        rot_deg = np.degrees(np.arctan2(transform_matrix[1, 0], transform_matrix[0, 0]))
+
+        with open(log_path, "w") as f:
+            f.write("=== Georeference Log ===\n")
+            f.write(f"Timestamp          : {timestamp}\n")
+            f.write(f"Process Time  : {process_time}\n")
+            f.write(f"LAS                : {args.las_path}\n")
+            f.write(f"SHP                : {args.shp_path}\n")
+            f.write(f"DEM                : {args.dem_path}\n")
+            f.write(f"Target CRS (EPSG)  : {tgt_epsg}\n\n")
+            f.write("--- Parameters ---\n")
+            for key, val in vars(args).items():
+                f.write(f"{key:<25}: {val}\n")
+            f.write("\n--- XY Correction Results ---\n")
+            f.write(f"XY Correction X    : {dx_m:.4f} m\n")
+            f.write(f"XY Correction Y    : {dy_m:.4f} m\n")
+            f.write(f"Rotation           : {rot_deg:.4f} degrees\n")
+            f.write(f"Matrix file        : {os.path.basename(matrix_path)}\n")
+        print(f"   -> Saved: {log_path}")
+
+        np.savetxt(matrix_path, transform_matrix, fmt="%.10f", delimiter=",")
+        print(f"   -> Saved: {matrix_path}")
+
+
+def georeference_main():
+    parser = argparse.ArgumentParser(description="Auto-georeference a LAS file to a road-edge SHP and DEM")
+ 
+    # --- Input / Output ---
+    parser.add_argument("las_path", help="Input LAS file path")
+    parser.add_argument("shp_path", help="Reference road-edge SHP file path")
+    parser.add_argument("dem_path", help="Reference DEM GeoTIFF path")
+    parser.add_argument("--out_dir", type=str, default=None, help="Output subdirectory inside results/")
+ 
+    # --- CRS ---
+    parser.add_argument("--src_epsg", type=int,   default=32653, help="EPSG code of input LAS (default: 32653)")
+    parser.add_argument("--tgt_epsg", type=int,   default=None,  help="Force target EPSG (default: auto from SHP)")
+ 
+    # --- Preprocessing ---
+    parser.add_argument("--pixel_size",     type=float, default=0.1,  help="Raster projection resolution in meters/pixel (default: 0.1)")
+    parser.add_argument("--buffer",         type=float, default=20.0, help="Grid buffer in meters (default: 20.0)")
+    parser.add_argument("--line_thickness", type=int,   default=3,    help="SHP line thickness in pixels (default: 3)")
+ 
+    # --- CSF-based ground filtering ---
+    parser.add_argument("--cloth_resolution", type=float, default=1.0, help="CSF cloth resolution (default: 1.0)")
+    parser.add_argument("--rigidness",        type=int,   default=3,   help="CSF rigidness parameter (default: 3)")
+    parser.add_argument("--class_threshold",  type=float, default=0.5, help="CSF classification threshold (default: 0.5)")
+    parser.add_argument("--h_min",            type=float, default=0.5, help="Minimum relative height of wall slice in meters (default: 0.5)")
+    parser.add_argument("--h_max",            type=float, default=2.5, help="Maximum relative height of wall slice in meters (default: 2.5)")
+    parser.add_argument("--dilate_iter",      type=int,   default=1,   help="Number of dilation iterations for wall slice image (default: 1)")
+    parser.add_argument("--close_kernel",     type=int,   default=7,   help="Kernel size for morphological closing of wall slice image (default: 7)")
+ 
+    # --- Template matching-based XY alignment ---
+    parser.add_argument("--decay_coefficient", type=float, default=0.10, help="Distance decay coefficient for SHP score image (default: 0.10)")
+    parser.add_argument("--search_range",      type=float, default=5.0,  help="XY search range in meters (default: 5.0)")
+    parser.add_argument("--angle_min",         type=float, default=-5.0, help="Rotation search min in degrees (default: -5.0)")
+    parser.add_argument("--angle_max",         type=float, default=5.0,  help="Rotation search max in degrees (default: 5.0)")
+    parser.add_argument("--angle_step",        type=float, default=0.25, help="Rotation search step in degrees (default: 0.25)")
+    parser.add_argument("--min_score",         type=float, default=0.15, help="Minimum alignment score threshold (default: 0.15)")
+ 
+    # --- DEM-based Z alignment ---
+    parser.add_argument("--smooth_kernel",      type=int,   default=51,     help="Gaussian kernel size for Z smoothing (default: 51)")
+    parser.add_argument("--grid_res",           type=float, default=2.0,    help="Adjustment grid resolution in meters (default: 2.0)")
+    parser.add_argument("--max_ground_samples", type=int,   default=200000, help="Max ground points sampled for Z alignment (default: 200000)")
+ 
+    # --- Log ---
+    parser.add_argument("--no_log", action="store_true", help="Suppress all intermediate and final image/log outputs (default: outputs enabled)")
     args = parser.parse_args()
 
-    myt_delta = datetime.timedelta(hours=8)
-    MYT = datetime.timezone(myt_delta, 'MYT')
-    timestamp = datetime.datetime.now(MYT).strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join("results", f"G_{timestamp}")
-    os.makedirs(output_dir, exist_ok = True)
-    print(f"::Output directory {os.path.abspath(output_dir)}")
+    timestamp  = datetime.datetime.now().strftime("%Y%m%d")
+    start_time = datetime.datetime.now()
 
-    geo = AutoGeoreferencer(pixel_size=args.pixel_size)
+    output_dir = os.path.join(f"results", args.out_dir) if args.out_dir else f"results/{timestamp}"
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Load LAS
-    las_data, pcd = geo.load_las(args.las_path)
-    if las_data is None: return
+    max_index = 0
+    for entry in os.listdir(output_dir):
+        if entry.startswith("g") and os.path.isdir(os.path.join(output_dir, entry)):
+            try:
+                idx = int(entry.replace("g", ""))
+                if idx > max_index:
+                    max_index = idx
+            except ValueError:
+                pass
 
-    # 2. Load SHP
+    new_index = max_index + 1
+    log_dir = os.path.join(output_dir, f"g{new_index}_log")
+    os.makedirs(log_dir, exist_ok=True)
+    output_las_path = os.path.join(output_dir, f"g{new_index}.las")
+    base_filename = f"g{new_index}"
+    print(f":: Output directory: {os.path.abspath(output_dir)}")
+
+    georeferencer = AutoGeoreferencer(pixel_size=args.pixel_size)
+
+    pcd, las = georeferencer.load_las(args.las_path)
+    if las is None:
+        return
+
+    las_crs = las.header.parse_crs()
+    tgt_crs = None
+    src_crs = None
+    if las_crs is not None:
+        print(f"   -> Auto-detected CRS from LAS: {las_crs.name}")
+        src_crs = las_crs
+    else:
+        print(f"   -> No CRS info in LAS header. Using fallback (--src_crs): EPSG:{args.src_epsg}")
+        src_crs = CRS.from_user_input(args.src_epsg)
+        
     print(f":: Reading SHP file: {args.shp_path}")
     try:
         gdf = gpd.read_file(args.shp_path)
@@ -482,67 +496,74 @@ def georeference_main():
         print(f"!! Error reading SHP file: {e}")
         return
 
-    target_crs = None
-    if args.target_epsg is not None:
-        target_crs = CRS.from_epsg(args.target_epsg)
-        gdf.set_crs(target_crs, allow_override=True, inplace=True)
+    tgt_crs = None
+    if args.tgt_epsg is not None:
+        tgt_crs = CRS.from_epsg(args.tgt_epsg)
+        gdf.set_crs(tgt_crs, allow_override=True, inplace=True)
     elif gdf.crs is not None:
-        target_crs = gdf.crs
-        print(f"   -> Target CRS detected: {target_crs.name}")
+        tgt_crs = gdf.crs
+        print(f"   -> Target CRS detected: {tgt_crs.name}")
     else:
-        print("!! ERROR: No CRS detected. Use --target_epsg.")
+        print("!! ERROR: No CRS detected. Use --tgt_epsg")
+        return
+    
+    las, pcd = georeferencer.convert_crs(las, pcd, src_crs=src_crs, tgt_crs=tgt_crs)
+    if las is None:
         return
 
-    # 3. Convert CRS (XY)
-    las_data, pcd = geo.convert_las_crs(las_data, pcd, src_epsg=args.las_epsg, target_crs=target_crs)
-    if las_data is None: return
+    grid_bbox = georeferencer.setup_grid(las, buffer=args.buffer)
+    shp_img   = georeferencer.rasterize_shp(gdf, grid_bbox, args.line_thickness)
+    las_img   = georeferencer.rasterize_las_slice(
+        pcd, 
+        cloth_resolution=args.cloth_resolution, 
+        rigidness=args.rigidness, 
+        class_threshold=args.class_threshold, 
+        h_min=args.h_min, h_max=args.h_max, 
+        dilate_iter=args.dilate_iter, 
+        close_kernel=args.close_kernel
+        )
 
-    # 4. Grid Setup
-    bbox = geo.setup_grid(las_data, buffer=20.0)
-
-    # 5. Process Images
-    img_shp = geo.process_shp(gdf, bbox)
-    img_las = geo.process_las_slice(pcd, h_min=1.0, h_max=1.5)
-    
-    if img_shp is None or img_las is None: 
-        print("!! Error generating process images.")
+    if shp_img is None or las_img is None:
+        print("!! Error generating process images")
         return
 
-    cv2.imwrite(os.path.join(output_dir, "debug_shp.png"), img_shp)
-    cv2.imwrite(os.path.join(output_dir, "debug_las.png"), img_las)
+    transform_matrix = georeferencer.estimate_transform(
+        las_img, shp_img, 
+        alpha=args.decay_coefficient, 
+        search_range_m=args.search_range, 
+        angle_min=args.angle_min, 
+        angle_max=args.angle_max, 
+        angle_step=args.angle_step, 
+        min_score=args.min_score
+        )
 
-    # 6. Calc Transform
-    M_pixel = geo.calculate_transform(img_las, img_shp)
+    if transform_matrix is None:
+        print("!! Alignment failed")
+        return
+
+    las = georeferencer.apply_xy_transform(las, transform_matrix)
+
+    ground_pts_before, ground_pts_after, dem_z = georeferencer.align_z_with_dem(
+        las, args.dem_path, 
+        tgt_crs, smooth_kernel_size=args.smooth_kernel, 
+        grid_res=args.grid_res, 
+        max_ground_samples=args.max_ground_samples
+        )
+
+    georeferencer.save_las(las, output_las_path, tgt_crs)
+    end_time = datetime.datetime.now()
+    process_time =  end_time - start_time
     
-    if M_pixel is not None:
-        geo.save_result_overlay(img_las, img_shp, M_pixel, output_path=os.path.join(output_dir, "result_overlay.png"))
-        
-        # Apply XY Transform
-        las_data = geo.apply_xy_transform_memory(las_data, M_pixel)
-        
-        # 7. Apply Smooth Z Transform
-        if args.dem_path:
-            geo.align_z_smoothly(las_data, args.dem_path, target_crs, smooth_kernel_size=args.smooth_kernel)
-        
-        # Save
-        base_name = os.path.splitext(os.path.basename(args.las_path))[0]
-        output_filename = f"{base_name}_AG.las"
-        final_output_path = os.path.join(output_dir, output_filename)
-        geo.save_las(las_data, final_output_path, target_crs)
+    if not args.no_log:
+        print(":: Generating result overlay images and logs")
 
-        # Log
-        dx_m = M_pixel[0, 2] * args.pixel_size
-        dy_m = M_pixel[1, 2] * args.pixel_size
-        rotation_rad = np.arctan2(M_pixel[1, 0], M_pixel[0, 0])
-        
-        with open(os.path.join(output_dir, "processing_info.txt"), "w", encoding="utf-8") as f:
-            f.write(f"XY Correction X: {dx_m:.4f} m\n")
-            f.write(f"XY Correction Y: {dy_m:.4f} m\n")
-            f.write(f"Rotation: {np.degrees(rotation_rad):.4f} degrees\n")
-            if args.dem_path:
-                f.write(f"Used DEM: {args.dem_path} (Smooth Local Adjustment)\n")
-    else:
-        print("!! Alignment failed.")
+        exporter = GeoreferencingExporter(log_dir, base_filename, args.pixel_size)
+
+        exporter.save_overlay(las_img, shp_img, suffix="01_before")
+        exporter.save_overlay(las_img, shp_img, suffix="02_after", transform_matrix=transform_matrix)
+        exporter.save_dem_ground_overlay(ground_pts_before, dem_z, suffix="04_dem_before")
+        exporter.save_dem_ground_overlay(ground_pts_after,  dem_z, suffix="05_dem_after")
+        exporter.write_execution_log(args, timestamp, process_time, transform_matrix, args.tgt_epsg)
 
 if __name__ == "__main__":
     georeference_main()

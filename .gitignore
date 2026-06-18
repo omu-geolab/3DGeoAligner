@@ -5,6 +5,8 @@
 # 除外フォルダ
 data/
 results/
+configs/
+results/
 
 #布ノードファイル
 cloth_nodes.txt

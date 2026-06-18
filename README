@@ -13,6 +13,9 @@ GeoAligner/                (プロジェクトのルートフォルダ)
 │   ├── main.py            (File: 実行の起点となるスクリプト)
 │   ├── georeference.py    (File: 幾何補正などの個別モジュール)
 │   └── registration.py    (File: 位置合わせなどの個別モジュール)
+|
+├── configs/batch_jobs.json (File: バッチ処理の設定ファイル)
+|   └── registration.py
 │
 | --- [データ管理群] ---
 ├── data/                  (Folder: データの保管場所)
@@ -37,6 +40,11 @@ GeoAligner/                (プロジェクトのルートフォルダ)
 ・コンテナ完全削除: docker compose down
 
 # デモプレイ
+## main.py
+### バッチ処理
+python scripts/main.py batch configs/batch_jobs.json
+python scripts/main.py batch configs/batch_eval_20260416_R1.json
+
 ## registration.py
 python scripts/registration.py data/raw/20251211_tondabayashi/epsg32653/scaniverse_tondabayashi_02.las data/raw/20251211_tondabayashi/epsg32653/scaniverse_tondabayashi_01.las
 
