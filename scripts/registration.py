@@ -13,6 +13,25 @@ import CSF
 from scipy.spatial import cKDTree
 import copy
 import datetime
+import time
+from functools import wraps
+import platform
+import psutil
+import scipy
+
+time_log = []
+
+def timer(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        print(f":: {func.__name__}")
+        t0 = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() -t0
+        print(f"   -> Completed in {elapsed: 4f}s")
+        time_log.append((func.__name__, elapsed))
+        return result
+    return wrapper
 
 
 class AutoRegistrator:
@@ -25,6 +44,7 @@ class AutoRegistrator:
         self.img_w = 0
         self.img_h = 0
 
+    @timer
     def load_las(self, input_path, keep_raw):
         print(f":: Loading LAS file: {input_path}")
 
@@ -52,6 +72,7 @@ class AutoRegistrator:
         print(f"   -> Loaded {len(pcd.points)} points (downsampled with voxel={self.voxel_size}m)")
         return pcd, las
 
+    @timer
     def extract_overlap(self, src_pcd, tgt_pcd, threshold):
         print(f":: Extracting overlap region (XY threshold: {threshold}m)")
 
@@ -72,6 +93,7 @@ class AutoRegistrator:
         
         return src_pcd.select_by_index(np.where(src_mask)[0]), tgt_pcd.select_by_index(np.where(tgt_mask)[0])
 
+    @timer
     def filter_ground(self, pcd, cloth_resolution, rigidness, class_threshold):
         print(":: Filtering ground with CSF")
 
@@ -93,6 +115,7 @@ class AutoRegistrator:
         
         return ground, non_ground
 
+    @timer
     def extract_slice(self, non_ground, ground, h_min, h_max):
         pts_ng = np.asarray(non_ground.points)
         pts_g = np.asarray(ground.points)
@@ -109,6 +132,7 @@ class AutoRegistrator:
 
         return non_ground.select_by_index(np.where(mask)[0])
 
+    @timer
     def project_to_image(self, src_pcd, tgt_pcd):
         src_pts = np.asarray(src_pcd.points)
         tgt_pts = np.asarray(tgt_pcd.points)
@@ -126,7 +150,7 @@ class AutoRegistrator:
                 self.img_w = int(np.ceil(width_m * self.scale)) + 10
                 self.img_h = int(np.ceil(height_m * self.scale)) + 10
                 print(f":: Projecting point cloud to 2D image")
-        
+
         def project(pts):
             if len(pts) == 0:
                 return np.zeros((self.img_h, self.img_w), dtype=np.uint8)
@@ -157,6 +181,7 @@ class AutoRegistrator:
         t = tgt_mean - R @ src_mean
         return np.hstack([R, t.reshape(2, 1)])
 
+    @timer
     def register_with_ORB(self, src_img, tgt_img, orb_nfeatures, ransac_iter, ransac_threshold, lowe_ratio):
         if np.sum(src_img) == 0 or np.sum(tgt_img) == 0:
             return np.eye(3), 0
@@ -202,6 +227,7 @@ class AutoRegistrator:
 
         return best_M, best_inliers_count
 
+    @timer
     def calculate_mean(self, src_img, tgt_img, M):
         if np.sum(src_img) == 0 or np.sum(tgt_img) == 0:
             return float('inf')
@@ -222,6 +248,7 @@ class AutoRegistrator:
         dists, _ = tree.query(src_pts_trans, k=1)
         return np.mean(dists)
 
+    @timer
     def apply_transform(self, pcd, M_pixel):
         if pcd.is_empty():
             return pcd, np.eye(4)
@@ -254,6 +281,7 @@ class AutoRegistrator:
 
         return new_pcd, M_world_3d
 
+    @timer
     def register_with_2DICP(self, src_pcd, tgt_pcd, threshold, max_iteration, relative_fitness, relative_rmse):
         print(f":: Running 2D-ICP refinement (threshold: {threshold}m)")
 
@@ -286,6 +314,7 @@ class AutoRegistrator:
         print(f"   -> Fitness: {reg_p2p.fitness:.4f}, RMSE: {reg_p2p.inlier_rmse:.4f}m")
         return reg_p2p.transformation, reg_p2p.fitness, reg_p2p.inlier_rmse
 
+    @timer
     def estimate_tilt_shift(self, src_ground_aligned, tgt_ground):
         src_pts = np.asarray(src_ground_aligned.points)
         tgt_pts = np.asarray(tgt_ground.points)
@@ -316,6 +345,7 @@ class AutoRegistrator:
         print(f"   -> Tilt X: {a:.6f}, Tilt Y: {b:.6f}, Z shift: {c:.4f}m")
         return a, b, c
 
+    @timer
     def save_las(self, output_path, original_las, aligned_points):
         print(f":: Saving registered point cloud as LAS: {output_path}")
         try:
@@ -376,9 +406,6 @@ class RegistrationExporter:
             raw_min_x, raw_max_x = all_x.min(), all_x.max()
             raw_min_z, raw_max_z = all_z.min(), all_z.max()
             
-            raw_range_x = raw_max_x - raw_min_x if raw_max_x != raw_min_x else 1.0
-            raw_range_z = raw_max_z - raw_min_z if raw_max_z != raw_min_z else 1.0
-                        
             min_x, max_x = raw_min_x - 10, raw_max_x + 10
             min_z, max_z = raw_min_z - 10, raw_max_z + 10
             
@@ -422,7 +449,7 @@ class RegistrationExporter:
         cv2.imwrite(img_output_path, overlay_img)
         print(f"   -> Saved: {img_output_path}")
 
-    def write_execution_log(self, args, is_success, timestamp, process_time, best_height, best_score, icp_fitness, icp_rmse, tilt_params, T_final):
+    def write_execution_log(self, args, is_success, timestamp, process_time, best_height, best_score, icp_fitness, icp_rmse, tilt_params, T_final, ram_before, ram_after, peak_ram, cpu_avg):
         log_path = os.path.join(self.log_dir, f"{self.base_filename}_log.txt")
         matrix_path = os.path.join(self.log_dir, f"{self.base_filename}_matrix.txt")
         print(f":: Writing execution log: {log_path}")
@@ -434,9 +461,30 @@ class RegistrationExporter:
             f.write(f"Source        : {args.source}\n")
             f.write(f"Target        : {args.target}\n")
             f.write(f"Status        : {'SUCCESS' if is_success else 'FAILED'}\n\n")
+
+            f.write("--- Environment ---\n")
+            f.write(f"OS                : {platform.system()} {platform.release()} ({platform.version()})\n")
+            f.write(f"Python            : {platform.python_version()}\n")
+            f.write(f"CPU               : {psutil.cpu_count(logical=False)} cores ({psutil.cpu_count(logical=True)} logical)\n")
+            f.write(f"CPU model         : {platform.processor()}\n")
+            f.write(f"CPU usage (avg)   : {cpu_avg:.1f}%\n")
+            f.write(f"RAM total         : {psutil.virtual_memory().total / 1024**3:.1f} GB\n")
+            f.write(f"RAM before        : {ram_before:.2f} GB\n")
+            f.write(f"RAM after         : {ram_after:.2f} GB\n")
+            f.write(f"RAM delta         : {ram_after - ram_before:+.2f} GB\n")
+            f.write(f"RAM peak (proc)   : {peak_ram:.2f} GB\n\n")            
+
+            f.write("--- Library Versions ---\n")
+            f.write(f"open3d            : {o3d.__version__}\n")
+            f.write(f"numpy             : {np.__version__}\n")
+            f.write(f"opencv            : {cv2.__version__}\n")
+            f.write(f"laspy             : {lp.__version__}\n")
+            f.write(f"scipy             : {scipy.__version__}\n\n")
+
             f.write("--- Parameters ---\n")
             for key, val in vars(args).items():
                 f.write(f"{key:<25}: {val}\n")
+            print("\n")
             
             if is_success:
                 f.write("\n--- Results ---\n")
@@ -448,6 +496,11 @@ class RegistrationExporter:
                     a, b, c = tilt_params
                     f.write(f"Tilt parameters   : a={a:.6f}, b={b:.6f}, c={c:.4f}\n")
                 f.write(f"Matrix file       : {os.path.basename(matrix_path)}\n")
+                
+                f.write("\n--- time ---\n")
+                for label, elapsed in time_log:
+                    f.write(f"{label:<30}: {elapsed:.4f}s\n")
+                f.write(f"{'Total':<30}: {process_time}s\n")      
         print(f"   -> Saved: {log_path}")
 
         if is_success and T_final is not None:
@@ -497,6 +550,9 @@ def registration_main():
     
     args = parser.parse_args()
 
+    proc = psutil.Process()
+    proc.cpu_percent(interval=None)
+    ram_before = psutil.virtual_memory().used / 1024**3
     timestamp = datetime.datetime.now().strftime("%Y%m%d")
     start_time = datetime.datetime.now()
 
@@ -622,8 +678,12 @@ def registration_main():
         SRC_pts[:, 2] += (a * SRC_pts[:, 0]) + (b * SRC_pts[:, 1]) + c
 
         registrator.save_las(output_las_path, SRC_las, SRC_pts)
-        end_time = datetime.datetime.now()
-        process_time =  end_time - start_time
+
+        process_time = datetime.datetime.now() - start_time
+        print(f":: Total processing time: {process_time}s")
+        ram_after = psutil.virtual_memory().used / 1024**3
+        peak_ram = proc.memory_info().rss / 1024**3
+        cpu_avg = proc.cpu_percent(interval=1)
 
     if not args.no_log:
         print(":: Generating result overlay images and logs")
@@ -663,7 +723,8 @@ def registration_main():
             process_time, best_height, 
             best_score, icp_fitness, 
             icp_rmse, tilt_params, 
-            T_final)
+            T_final, ram_before, 
+            ram_after, peak_ram, cpu_avg)
                
 if __name__ == "__main__":
     registration_main()

@@ -16,6 +16,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-RUN mkdir -p /app/data /app/results /app/src
-
-CMD ["/bin/bash"]
+RUN mkdir -p /app/data /app/results /app/scripts

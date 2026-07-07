@@ -17,6 +17,26 @@ import os
 import datetime
 import rasterio
 from scipy.interpolate import NearestNDInterpolator
+import time
+from functools import wraps
+import platform
+import psutil
+import scipy
+import re
+
+time_log = []
+
+def timer(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        print(f":: {func.__name__}")
+        t0 = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() -t0
+        print(f"   -> Completed in {elapsed: 4f}s")
+        time_log.append((func.__name__, elapsed))
+        return result
+    return wrapper
 
 
 class AutoGeoreferencer:
@@ -28,6 +48,7 @@ class AutoGeoreferencer:
         self.img_width   = 0
         self.img_height  = 0
 
+    @timer
     def load_las(self, path):
         print(f":: Loading LAS file: {path}")
         if not os.path.exists(path):
@@ -44,6 +65,7 @@ class AutoGeoreferencer:
         pcd.points = o3d.utility.Vector3dVector(points)
         return pcd, las
 
+    @timer
     def convert_crs(self, las_data, pcd, src_crs, tgt_crs, target_scale=0.001):
         print(f":: Converting LAS coordinates from {src_crs.name} to {tgt_crs.name}")
         try:
@@ -64,6 +86,7 @@ class AutoGeoreferencer:
         pcd.points = o3d.utility.Vector3dVector(np.vstack((new_x, new_y, original_z)).T)
         return las_data, pcd
 
+    @timer
     def setup_grid(self, las_data, buffer):
         las_x_min, las_x_max = np.min(las_data.x), np.max(las_data.x)
         las_y_min, las_y_max = np.min(las_data.y), np.max(las_data.y)
@@ -79,11 +102,13 @@ class AutoGeoreferencer:
         print(f"   -> [Grid] {self.img_width} x {self.img_height} px  ({self.pixel_size} m/px)")
         return box(self.grid_min_x, grid_min_y, grid_max_x, self.grid_max_y)
 
+    @timer
     def world_to_pixel(self, x, y):
         px = (x - self.grid_min_x) / self.pixel_size
         py = (self.grid_max_y - y) / self.pixel_size
         return px.astype(np.int32), py.astype(np.int32)
 
+    @timer
     def rasterize_shp(self, gdf, grid_bbox, line_thickness):
         print(":: Processing Shapefile features")
         try:
@@ -121,6 +146,7 @@ class AutoGeoreferencer:
 
         return shp_img
 
+    @timer
     def rasterize_las_slice(self, pcd, cloth_resolution, rigidness, class_threshold, h_min, h_max, dilate_iter, close_kernel):
         print(":: Filtering ground (CSF) and slicing walls")
         csf = CSF.CSF()
@@ -161,6 +187,7 @@ class AutoGeoreferencer:
         las_img = cv2.morphologyEx(las_img, cv2.MORPH_CLOSE, np.ones((close_kernel, close_kernel), np.uint8))
         return las_img
 
+    @timer
     def estimate_transform(self, las_img, shp_img, alpha, search_range_m, angle_min, angle_max, angle_step, min_score):
         print(":: Computing alignment")
         las_img_blur   = cv2.GaussianBlur(las_img, (5, 5), 0)
@@ -197,6 +224,7 @@ class AutoGeoreferencer:
         print(f"   -> Best Match Score: {best_score:.4f}")
         return best_M
 
+    @timer
     def apply_xy_transform(self, las_data, transform_matrix):
         print(":: Applying affine transformation (XY) to LAS coordinates")
         px    = (las_data.x - self.grid_min_x) / self.pixel_size
@@ -207,6 +235,7 @@ class AutoGeoreferencer:
         las_data.y = self.grid_max_y - transformed_pixels[1] * self.pixel_size
         return las_data
 
+    @timer
     def align_z_with_dem(self, las_data, dem_path, current_crs, smooth_kernel_size, grid_res, max_ground_samples, dem_valid_min=-1000, dem_valid_max=4000):
         print(f":: Starting smooth Z-alignment using DEM: {dem_path}")
 
@@ -301,6 +330,7 @@ class AutoGeoreferencer:
         ground_pts_after[:, 2] += grid_interp(np.column_stack(((las_y_max - ground_pts[:, 1]) / grid_res, (ground_pts[:, 0] - las_x_min) / grid_res)))
         return ground_pts_before, ground_pts_after, dem_z
 
+    @timer
     def save_las(self, las_data, output_path, tgt_crs, target_scale=0.001):
         print(f":: Saving LAS file -> {output_path}")
         header = lp.LasHeader(point_format=las_data.header.point_format,version=las_data.header.version)
@@ -375,7 +405,7 @@ class GeoreferencingExporter:
         cv2.imwrite(path, img)
         print(f"   -> Saved: {path}")
 
-    def write_execution_log(self, args, timestamp, process_time, transform_matrix, tgt_epsg):
+    def write_execution_log(self, args, timestamp, process_time, transform_matrix, tgt_epsg, ram_before, ram_after, peak_ram, cpu_avg):
         log_path    = os.path.join(self.log_dir, f"{self.base_filename}_log.txt")
         matrix_path = os.path.join(self.log_dir, f"{self.base_filename}_matrix.txt")
         print(f":: Writing execution log: {log_path}")
@@ -392,6 +422,29 @@ class GeoreferencingExporter:
             f.write(f"SHP                : {args.shp_path}\n")
             f.write(f"DEM                : {args.dem_path}\n")
             f.write(f"Target CRS (EPSG)  : {tgt_epsg}\n\n")
+
+            f.write("--- Environment ---\n")
+            f.write(f"OS                : {platform.system()} {platform.release()} ({platform.version()})\n")
+            f.write(f"Python            : {platform.python_version()}\n")
+            f.write(f"CPU               : {psutil.cpu_count(logical=False)} cores ({psutil.cpu_count(logical=True)} logical)\n")
+            f.write(f"CPU model         : {platform.processor()}\n")
+            f.write(f"CPU usage (avg)   : {cpu_avg:.1f}%\n")
+            f.write(f"RAM total         : {psutil.virtual_memory().total / 1024**3:.1f} GB\n")
+            f.write(f"RAM before        : {ram_before:.2f} GB\n")
+            f.write(f"RAM after         : {ram_after:.2f} GB\n")
+            f.write(f"RAM delta         : {ram_after - ram_before:+.2f} GB\n")
+            f.write(f"RAM peak (proc)   : {peak_ram:.2f} GB\n\n")
+
+            f.write("--- Library Versions ---\n")
+            f.write(f"open3d            : {o3d.__version__}\n")
+            f.write(f"numpy             : {np.__version__}\n")
+            f.write(f"opencv            : {cv2.__version__}\n")
+            f.write(f"laspy             : {lp.__version__}\n")
+            f.write(f"scipy             : {scipy.__version__}\n")
+            f.write(f"geopandas         : {gpd.__version__}\n")
+            f.write(f"rasterio          : {rasterio.__version__}\n\n")
+            f.write("--- Parameters ---\n")
+
             f.write("--- Parameters ---\n")
             for key, val in vars(args).items():
                 f.write(f"{key:<25}: {val}\n")
@@ -400,6 +453,11 @@ class GeoreferencingExporter:
             f.write(f"XY Correction Y    : {dy_m:.4f} m\n")
             f.write(f"Rotation           : {rot_deg:.4f} degrees\n")
             f.write(f"Matrix file        : {os.path.basename(matrix_path)}\n")
+            
+            f.write("\n--- time ---\n")
+            for label, elapsed in time_log:
+                f.write(f"{label:<30}: {elapsed:.4f}s\n")
+            f.write(f"{'Total':<30}: {process_time}s\n")      
         print(f"   -> Saved: {log_path}")
 
         np.savetxt(matrix_path, transform_matrix, fmt="%.10f", delimiter=",")
@@ -450,6 +508,9 @@ def georeference_main():
     parser.add_argument("--no_log", action="store_true", help="Suppress all intermediate and final image/log outputs (default: outputs enabled)")
     args = parser.parse_args()
 
+    proc = psutil.Process()
+    proc.cpu_percent(interval=None)
+    ram_before = psutil.virtual_memory().used / 1024**3
     timestamp  = datetime.datetime.now().strftime("%Y%m%d")
     start_time = datetime.datetime.now()
 
@@ -458,14 +519,15 @@ def georeference_main():
 
     max_index = 0
     for entry in os.listdir(output_dir):
-        if entry.startswith("g") and os.path.isdir(os.path.join(output_dir, entry)):
+        match = re.match(r'^g(\d+)', entry)
+        if match and os.path.isdir(os.path.join(output_dir, entry)):
             try:
-                idx = int(entry.replace("g", ""))
+                idx = int(match.group(1))
                 if idx > max_index:
                     max_index = idx
             except ValueError:
                 pass
-
+            
     new_index = max_index + 1
     log_dir = os.path.join(output_dir, f"g{new_index}_log")
     os.makedirs(log_dir, exist_ok=True)
@@ -551,8 +613,11 @@ def georeference_main():
         )
 
     georeferencer.save_las(las, output_las_path, tgt_crs)
-    end_time = datetime.datetime.now()
-    process_time =  end_time - start_time
+    process_time = datetime.datetime.now() - start_time
+    print(f":: Total processing time: {process_time}s")
+    ram_after = psutil.virtual_memory().used / 1024**3
+    peak_ram = proc.memory_info().rss / 1024**3
+    cpu_avg = proc.cpu_percent(interval=1)
     
     if not args.no_log:
         print(":: Generating result overlay images and logs")
@@ -563,7 +628,10 @@ def georeference_main():
         exporter.save_overlay(las_img, shp_img, suffix="02_after", transform_matrix=transform_matrix)
         exporter.save_dem_ground_overlay(ground_pts_before, dem_z, suffix="04_dem_before")
         exporter.save_dem_ground_overlay(ground_pts_after,  dem_z, suffix="05_dem_after")
-        exporter.write_execution_log(args, timestamp, process_time, transform_matrix, args.tgt_epsg)
+        exporter.write_execution_log(args, timestamp, 
+                                     process_time, transform_matrix, 
+                                     args.tgt_epsg, ram_before, 
+                                     ram_after, peak_ram, cpu_avg)
 
 if __name__ == "__main__":
     georeference_main()

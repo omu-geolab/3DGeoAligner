@@ -2,11 +2,9 @@ numpy
 opencv-python
 open3d>=0.16.0
 laspy[lazrs]
-pandas
 scipy
-scikit-learn
-matplotlib
 pyproj
 cloth-simulation-filter
 geopandas
 rasterio
+psutil
