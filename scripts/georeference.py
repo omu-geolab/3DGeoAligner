@@ -23,6 +23,8 @@ import platform
 import psutil
 import scipy
 import re
+from rasterio.warp import calculate_default_transform, reproject
+import tempfile
 
 time_log = []
 
@@ -67,7 +69,11 @@ class AutoGeoreferencer:
 
     @timer
     def convert_crs(self, las_data, pcd, src_crs, tgt_crs, target_scale=0.001):
-        print(f":: Converting LAS coordinates from {src_crs.name} to {tgt_crs.name}")
+        if src_crs == tgt_crs:
+            print(f":: LAS already in target CRS ({tgt_crs.name}); skipping reprojection")
+            return las_data, pcd
+
+        print(f":: Converting LAS coordinates from {src_crs.name} to {tgt_crs.name}")        
         try:
             crs_transformer = Transformer.from_crs(src_crs, tgt_crs, always_xy=True)
         except Exception as e:
@@ -85,6 +91,38 @@ class AutoGeoreferencer:
 
         pcd.points = o3d.utility.Vector3dVector(np.vstack((new_x, new_y, original_z)).T)
         return las_data, pcd
+    
+    @timer
+    def reproject_shp(self, gdf, tgt_crs):
+        if gdf.crs is None:
+            print("!! ERROR: SHP file has no CRS information; cannot reproject")
+            return None
+
+        if gdf.crs == tgt_crs:
+            print(f":: SHP already in target CRS ({tgt_crs.name}); skipping reprojection")
+            return gdf
+
+        print(f":: Reprojecting SHP from {gdf.crs.name} to {tgt_crs.name}")
+        return gdf.to_crs(tgt_crs)
+    
+    @timer
+    def reproject_dem(self, dem_path, tgt_crs):
+        with rasterio.open(dem_path) as src:
+            if src.crs == tgt_crs:
+                print(f":: DEM already in target CRS ({tgt_crs.name}); skipping reprojection")
+                return dem_path
+
+            print(f":: Reprojecting DEM from {src.crs} to {tgt_crs.name}")
+            transform, width, height = calculate_default_transform(src.crs, tgt_crs, src.width, src.height, *src.bounds)
+            kwargs = src.meta.copy()
+            kwargs.update({'crs': tgt_crs,'transform': transform,'width': width,'height': height})
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tif")
+            os.close(tmp_fd)
+
+            with rasterio.open(tmp_path, "w", **kwargs) as dst:
+                for i in range(1, src.count + 1):
+                    reproject(source=rasterio.band(src, i), destination=rasterio.band(dst, i), src_transform=src.transform, src_crs=src.crs, dst_transform=transform, dst_crs=tgt_crs)
+        return tmp_path
 
     @timer
     def setup_grid(self, las_data, buffer):
@@ -421,7 +459,7 @@ class GeoreferencingExporter:
             f.write(f"LAS                : {args.las_path}\n")
             f.write(f"SHP                : {args.shp_path}\n")
             f.write(f"DEM                : {args.dem_path}\n")
-            f.write(f"Target CRS (EPSG)  : {tgt_epsg}\n\n")
+            f.write(f"working CRS (EPSG)  : {tgt_epsg}\n\n")
 
             f.write("--- Environment ---\n")
             f.write(f"OS                : {platform.system()} {platform.release()} ({platform.version()})\n")
@@ -474,9 +512,7 @@ def georeference_main():
     parser.add_argument("--out_dir", type=str, default=None, help="Output subdirectory inside results/")
  
     # --- CRS ---
-    parser.add_argument("--src_epsg", type=int,   default=32653, help="EPSG code of input LAS (default: 32653)")
-    parser.add_argument("--tgt_epsg", type=int,   default=None,  help="Force target EPSG (default: auto from SHP)")
- 
+    parser.add_argument("--epsg", type=int, default=32653, help="EPSG code to reproject and process everything in (default: use the point cloud's own CRS)") 
     # --- Preprocessing ---
     parser.add_argument("--pixel_size",     type=float, default=0.1,  help="Raster projection resolution in meters/pixel (default: 0.1)")
     parser.add_argument("--buffer",         type=float, default=20.0, help="Grid buffer in meters (default: 20.0)")
@@ -540,41 +576,41 @@ def georeference_main():
     pcd, las = georeferencer.load_las(args.las_path)
     if las is None:
         return
-
+    
     las_crs = las.header.parse_crs()
-    tgt_crs = None
-    src_crs = None
     if las_crs is not None:
         print(f"   -> Auto-detected CRS from LAS: {las_crs.name}")
         src_crs = las_crs
+    elif args.epsg is not None:
+        print(f"   -> No CRS info in LAS header. Assuming LAS is already in --epsg: {args.epsg}")
+        src_crs = CRS.from_epsg(args.epsg)
     else:
-        print(f"   -> No CRS info in LAS header. Using fallback (--src_crs): EPSG:{args.src_epsg}")
-        src_crs = CRS.from_user_input(args.src_epsg)
-        
-    print(f":: Reading SHP file: {args.shp_path}")
-    try:
-        gdf = gpd.read_file(args.shp_path)
-    except Exception as e:
-        print(f"!! Error reading SHP file: {e}")
+        print("!! ERROR: No CRS info in LAS header and --epsg not specified. Cannot determine working CRS.")
+        return    print(f":: Reading SHP file: {args.shp_path}")
+    
+    working_crs = CRS.from_epsg(args.epsg) if args.epsg is not None else src_crs
+
+    if working_crs.is_geographic:
+        print(f"!! ERROR: Working CRS ({working_crs.name}) is geographic (degrees), not projected (meters).")
+        print("   Specify a projected CRS via --epsg (e.g. 32653) ")
         return
 
-    tgt_crs = None
-    if args.tgt_epsg is not None:
-        tgt_crs = CRS.from_epsg(args.tgt_epsg)
-        gdf.set_crs(tgt_crs, allow_override=True, inplace=True)
-    elif gdf.crs is not None:
-        tgt_crs = gdf.crs
-        print(f"   -> Target CRS detected: {tgt_crs.name}")
-    else:
-        print("!! ERROR: No CRS detected. Use --tgt_epsg")
-        return
-    
-    las, pcd = georeferencer.convert_crs(las, pcd, src_crs=src_crs, tgt_crs=tgt_crs)
+    print(f":: Working CRS for this run: {working_crs.name} (EPSG:{working_crs.to_epsg()})")
+
+    las, pcd = georeferencer.convert_crs(las, pcd, src_crs=src_crs, tgt_crs=working_crs)
     if las is None:
         return
+    
+    print(f":: Reading SHP file: {args.shp_path}")
+    gdf = gpd.read_file(args.shp_path)
+    gdf = georeferencer.reproject_shp(gdf, working_crs)
+    if gdf is None:
+        return
+    dem_path = georeferencer.reproject_dem(args.dem_path, working_crs)
 
     grid_bbox = georeferencer.setup_grid(las, buffer=args.buffer)
     shp_img   = georeferencer.rasterize_shp(gdf, grid_bbox, args.line_thickness)
+
     las_img   = georeferencer.rasterize_las_slice(
         pcd, 
         cloth_resolution=args.cloth_resolution, 
@@ -606,13 +642,13 @@ def georeference_main():
     las = georeferencer.apply_xy_transform(las, transform_matrix)
 
     ground_pts_before, ground_pts_after, dem_z = georeferencer.align_z_with_dem(
-        las, args.dem_path, 
-        tgt_crs, smooth_kernel_size=args.smooth_kernel, 
+        las, dem_path, 
+        working_crs, smooth_kernel_size=args.smooth_kernel, 
         grid_res=args.grid_res, 
         max_ground_samples=args.max_ground_samples
         )
 
-    georeferencer.save_las(las, output_las_path, tgt_crs)
+    georeferencer.save_las(las, output_las_path, working_crs)
     process_time = datetime.datetime.now() - start_time
     print(f":: Total processing time: {process_time}s")
     ram_after = psutil.virtual_memory().used / 1024**3
@@ -630,7 +666,7 @@ def georeference_main():
         exporter.save_dem_ground_overlay(ground_pts_after,  dem_z, suffix="05_dem_after")
         exporter.write_execution_log(args, timestamp, 
                                      process_time, transform_matrix, 
-                                     args.tgt_epsg, ram_before, 
+                                     working_crs.to_epsg(), ram_before, 
                                      ram_after, peak_ram, cpu_avg)
 
 if __name__ == "__main__":
