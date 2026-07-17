@@ -117,7 +117,7 @@ python scripts/registration.py data/scaniverse_tondabayashi_01.las \
                                 --out_dir demo_01_02
 ```
 
-Results (registered LAS as `r[n].las`, transformation matrix, overlay images, and an execution log) are written to `results/demo_01_02/` (see [Output](#output) for the full naming convention).
+Results are written to `results/demo_01_02/` (see [Output](#output) for the full naming convention).
 
 Key optional parameters (see `python scripts/registration.py --help` for the full list):
 
@@ -132,7 +132,7 @@ Key optional parameters (see `python scripts/registration.py --help` for the ful
 | `--icp_threshold_factor` / `--icp_max_iter` | `0.75` / `2000` | 2D ICP refinement parameters |
 | `--no_log` | off | Suppress the `r[n]_log/` overlay images / execution log output |
 
-To reconstruct the full demo area, chain the registration pairwise (e.g. register `01→02`, then feed the resulting aligned cloud in as the new source for `02→03` registration, and so on along the T-shaped route).
+To reconstruct the full demo area, chain the registration pairwise (e.g. register `01→02`, then feed the resulting aligned cloud in as the new target for `02→03` registration, and so on along the T-shaped route).
 
 ### 2. Georeferencing
 
@@ -147,7 +147,7 @@ python scripts/georeference.py data/scaniverse_tondabayashi_01-05.las \
 
 Road-edge and DEM reference data can be obtained free of charge from your national mapping agency (in Japan: GSI's Fundamental Geospatial Data). Convert road-edge data to Shapefile and DEM data to GeoTIFF before use (see [Demo Data](#demo-data) for the exact source files used in this demo). Run `python scripts/georeference.py --help` for the exact set of available options.
 
-Results (georeferenced LAS as `g[n].las`, transformation matrix, overlay images, and an execution log) are written to `results/demo_georef/` (see [Output](#output) for the full naming convention).
+Results are written to `results/demo_georef/` (see [Output](#output) for the full naming convention).
 
 Key optional parameters (see `python scripts/georeference.py --help` for the full list):
 
@@ -177,4 +177,4 @@ We thank Tondabayashi City, Osaka Prefecture, Japan, for providing access to exp
 
 ## License
 
-Add your chosen license here (e.g. MIT, Apache-2.0) before publishing.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
