@@ -23,7 +23,7 @@ The core idea is to **decompose 3D registration and georeferencing into independ
 ```
 .
 ├── docker-compose.yaml
-├── Dockerfile
+├── dockerfile
 ├── results
 ├── scripts/
 │   ├── registration.py       # Point cloud ↔ point cloud registration
