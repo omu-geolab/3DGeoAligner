@@ -6,18 +6,16 @@ This repository provides the reference implementation of the method described in
 
 > Ueda, R., Yoshida, D. *A Pipeline for Low-Cost Wide-Area 3D Mapping Using LiDAR-Equipped Mobile Devices and Open Data.* (ISPRS, 2026)
 
-The pipeline integrates multiple locally captured point clouds (e.g. from an iPhone/iPad LiDAR scanner) into a single, georeferenced 3D map, using only consumer mobile devices and publicly available open geospatial data — no survey-grade equipment (MMS/TLS/GNSS base stations) required.
+The pipeline integrates multiple locally captured point clouds into a single, georeferenced 3D map. The process requires only mobile devices (e.g. iPhone Pro/iPad) and open geospatial data (Road Edge Data and 5m DEM).
 
-The core idea is to **decompose 3D registration and georeferencing into independent horizontal and vertical steps**, which improves robustness against the noise and drift inherent in mobile LiDAR scanning while keeping computation lightweight.
-
-Validation in Tondabayashi City, Japan achieved a horizontal RMSE of 1.75 m and a vertical RMSE of 0.10 m, meeting the accuracy requirements for 1:2,500-scale disaster prevention base maps.
+The core idea is to **decompose 3D registration and georeferencing into independent horizontal and vertical steps**, which reduces errors and improve computational efficiency.
 
 ## Pipeline Overview
 
 | Stage | Script | Description |
 |---|---|---|
-| **Registration** | `scripts/registration.py` | Aligns a source point cloud to a target (adjacent) point cloud. Extracts the mutually overlapping region, separates ground / non-ground points via Cloth Simulation Filter (CSF), then performs horizontal registration (2D rasterization → ORB feature matching → 2D ICP) followed by vertical registration (planar least-squares fit on ground points). |
-| **Georeferencing** | `scripts/georeference.py` | Assigns absolute coordinates to the registered/integrated point cloud by matching non-ground wall features against open road-edge vector data (horizontal) and fitting ground points to a public Digital Elevation Model, or DEM (vertical). |
+| **Registration** | `scripts/registration.py` | Aligns a source point cloud to a target (adjacent) point cloud. |
+| **Georeferencing** | `scripts/georeference.py` | Assigns absolute coordinates to the registered/integrated point cloud. |
 
 Both scripts follow the same underlying strategy from the paper: separate ground/non-ground points with CSF, then solve the horizontal and vertical problems independently.
 
@@ -27,6 +25,7 @@ Both scripts follow the same underlying strategy from the paper: separate ground
 .
 ├── docker-compose.yaml
 ├── Dockerfile
+├── results
 ├── scripts/
 │   ├── registration.py       # Point cloud ↔ point cloud registration
 │   └── georeference.py       # Point cloud ↔ open data georeferencing
@@ -35,7 +34,8 @@ Both scripts follow the same underlying strategy from the paper: separate ground
     ├── scaniverse_tondabayashi_02.las
     ├── scaniverse_tondabayashi_03.las
     ├── scaniverse_tondabayashi_04.las
-    └── scaniverse_tondabayashi_05.las
+    ├── scaniverse_tondabayashi_05.las
+    └── scaniverse_tondabayashi_01-05.las
 ```
 
 ## Demo Data
@@ -43,9 +43,9 @@ Both scripts follow the same underlying strategy from the paper: separate ground
 Five sample scans captured with an iPad Pro (LiDAR) using the **Scaniverse** app are provided in `data/` for trying out the pipeline end to end. The scans were collected along adjacent, overlapping routes in the Jinaimachi district, Tondabayashi City, Osaka, Japan, and connect in a **T-shape** layout:
 
 ```
-        Scan 5
-          |
-Scan 1 — Scan 2 — Scan 3 — Scan 4
+               Scan 5
+                 |
+Scan 1 — Scan 2 — — Scan 3 — Scan 4
 ```
 
 Adjacent, overlapping pairs suitable for registration are:
@@ -118,16 +118,29 @@ To reconstruct the full demo area, chain the registration pairwise (e.g. registe
 
 ### 2. Georeferencing
 
-Once point clouds are registered/integrated into a single local coordinate frame, assign absolute coordinates using open reference data (road-edge vectors and a DEM):
+Once point clouds are registered/integrated into a single local coordinate frame, assign absolute coordinates using open reference data (road-edge vectors and a DEM). `las_path`, `road_edge.shp`, and `dem.tif` are positional arguments, in that order:
 
 ```bash
-python scripts/georeference.py <integrated_point_cloud.las> \
-                                --road_edge <road_edge.shp> \
-                                --dem <dem.tif> \
+python scripts/georeference.py scaniverse_tondabayashi_01-05.las \
+                                <road_edge.shp> \
+                                <dem.tif> \
                                 --out_dir demo_georef
 ```
 
-> Road-edge and DEM reference data can be obtained free of charge from your national mapping agency (in Japan: GSI's Fundamental Geospatial Data). Convert road-edge data to Shapefile and DEM data to GeoTIFF before use, as described in the paper. Run `python scripts/georeference.py --help` for the exact set of available options.
+Road-edge and DEM reference data can be obtained free of charge from your national mapping agency (in Japan: GSI's Fundamental Geospatial Data). Convert road-edge data to Shapefile and DEM data to GeoTIFF before use, as described in the paper. Run `python scripts/georeference.py --help` for the exact set of available options.
+
+Key optional parameters (see `python scripts/georeference.py --help` for the full list):
+
+| Argument | Default | Description |
+|---|---|---|
+| `--epsg` | `32653` | EPSG code to reproject and process everything in |
+| `--pixel_size` / `--buffer` / `--line_thickness` | `0.1` / `20.0` / `3` | Rasterization settings for the road-edge / wall-slice images |
+| `--cloth_resolution` / `--rigidness` / `--class_threshold` | `1.0` / `3` / `0.5` | CSF ground-filtering parameters |
+| `--h_min` / `--h_max` | `0.5` / `2.5` | Relative height range of the wall slice used for horizontal alignment (m) |
+| `--dilate_iter` / `--close_kernel` | `1` / `7` | Morphological smoothing of the wall-slice image |
+| `--decay_coefficient` / `--search_range` / `--angle_min` / `--angle_max` / `--angle_step` / `--min_score` | `0.10` / `5.0` / `-5.0` / `5.0` / `0.25` / `0.15` | Template-matching search parameters for horizontal alignment |
+| `--smooth_kernel` / `--grid_res` / `--max_ground_samples` | `51` / `2.0` / `200000` | DEM-based vertical (Z) alignment parameters |
+| `--no_log` | off | Suppress overlay images / log output |
 
 ## Method Summary
 
