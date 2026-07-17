@@ -59,8 +59,8 @@ These pairs can be chained to reconstruct the full T-shaped area (e.g. register 
 
 For the georeferencing demo, the following GSI (Geospatial Information Authority of Japan) Fundamental Geospatial Data products were obtained and converted before use:
 
-- `FG-GML-5135-54-98-DEM5A-20250711.tif.aux.xml` (5m DEM) → converted to a GeoTIFF (`.tif`) and used as the `dem_path` reference input.
 - `FG-GML-513554-RdEdg-20260401-0001.xml` (road edge data) → converted to a Shapefile (`.shp`) and used as the `shp_path` reference input.
+- `FG-GML-5135-54-98-DEM5A-20250711.tif.aux.xml` (5m DEM) → converted to a GeoTIFF (`.tif`) and used as the `dem_path` reference input.
 
 ## Requirements
 
