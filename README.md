@@ -17,7 +17,6 @@ The core idea is to **decompose 3D registration and georeferencing into independ
 | **Registration** | `scripts/registration.py` | Aligns a source point cloud to a target (adjacent) point cloud. |
 | **Georeferencing** | `scripts/georeference.py` | Assigns absolute coordinates to the registered/integrated point cloud. |
 
-Both scripts follow the same underlying strategy from the paper: separate ground/non-ground points with CSF, then solve the horizontal and vertical problems independently.
 
 ## Repository Structure
 
@@ -58,6 +57,11 @@ Adjacent, overlapping pairs suitable for registration are:
 
 These pairs can be chained to reconstruct the full T-shaped area (e.g. register `01`→`02`, then use the result as the new target for `03`, and so on).
 
+For the georeferencing demo, the following GSI (Geospatial Information Authority of Japan) Fundamental Geospatial Data products were obtained and converted before use:
+
+- `FG-GML-5135-54-98-DEM5A-20250711.tif.aux.xml` (5m DEM) → converted to a GeoTIFF (`.tif`) and used as the `dem_path` reference input.
+- `FG-GML-513554-RdEdg-20260401-0001.xml` (road edge data) → converted to a Shapefile (`.shp`) and used as the `shp_path` reference input.
+
 ## Requirements
 
 The pipeline is built on the following open-source components:
@@ -79,13 +83,27 @@ A `docker-compose.yaml` is provided for a reproducible environment.
 
 ```bash
 # Build and start the container
-docker compose up -d --build
+docker-compose up -d --build
 
 # Attach a shell inside the container
-docker compose exec 3d-geo-aligner bash
+docker-compose exec 3d-geo-aligner bash
 ```
 
 The repository is mounted at `/app` inside the container.
+
+## Output
+
+Every run writes its results under `results/`.
+
+- If `--out_dir <name>` is given, output goes to `results/<name>/`.
+- Otherwise, output goes to `results/<YYYYMMDD>/` (today's date), so multiple runs on the same day share a dated folder.
+
+Within that folder, each run is numbered automatically by scanning existing output for the highest existing index and incrementing it (so re-running against the same `--out_dir`/date accumulates numbered attempts rather than overwriting):
+
+- **Registration** writes the aligned point cloud as `r[n].las`, where `[n]` is the attempt number (e.g. `r1.las`, `r2.las`, ...).
+- **Georeferencing** writes the aligned point cloud as `g[n].las` (e.g. `g1.las`, `g2.las`, ...).
+
+Unless `--no_log` is passed, each run also writes a companion log folder alongside the `.las` file — `r[n]_log/` for registration or `g[n]_log/` for georeferencing — containing the transformation matrix, overlay images, and an execution log (parameters used, timing, and success/failure details). Passing `--no_log` suppresses this folder and its contents entirely.
 
 ## Usage
 
@@ -99,7 +117,7 @@ python scripts/registration.py data/scaniverse_tondabayashi_01.las \
                                 --out_dir demo_01_02
 ```
 
-Results (registered LAS, transformation matrix, overlay images, and an execution log) are written to `results/demo_01_02/`.
+Results (registered LAS as `r[n].las`, transformation matrix, overlay images, and an execution log) are written to `results/demo_01_02/` (see [Output](#output) for the full naming convention).
 
 Key optional parameters (see `python scripts/registration.py --help` for the full list):
 
@@ -112,7 +130,7 @@ Key optional parameters (see `python scripts/registration.py --help` for the ful
 | `--slice_h_min` / `--slice_h_max` / `--slice_step` / `--slice_thickness` | `0.7` / `2.5` / `0.2` / `0.2` | Height range searched for the best wall slice used in matching (m) |
 | `--orb_nfeatures` / `--ransac_iter` / `--ransac_threshold` / `--lowe_ratio` | `5000` / `10000` / `3.0` / `0.75` | ORB + RANSAC matching parameters |
 | `--icp_threshold_factor` / `--icp_max_iter` | `0.75` / `2000` | 2D ICP refinement parameters |
-| `--no_log` | off | Suppress overlay images / log output |
+| `--no_log` | off | Suppress the `r[n]_log/` overlay images / execution log output |
 
 To reconstruct the full demo area, chain the registration pairwise (e.g. register `01→02`, then feed the resulting aligned cloud in as the new source for `02→03` registration, and so on along the T-shaped route).
 
@@ -121,13 +139,15 @@ To reconstruct the full demo area, chain the registration pairwise (e.g. registe
 Once point clouds are registered/integrated into a single local coordinate frame, assign absolute coordinates using open reference data (road-edge vectors and a DEM). `las_path`, `road_edge.shp`, and `dem.tif` are positional arguments, in that order:
 
 ```bash
-python scripts/georeference.py scaniverse_tondabayashi_01-05.las \
+python scripts/georeference.py data/scaniverse_tondabayashi_01-05.las \
                                 <road_edge.shp> \
                                 <dem.tif> \
                                 --out_dir demo_georef
 ```
 
-Road-edge and DEM reference data can be obtained free of charge from your national mapping agency (in Japan: GSI's Fundamental Geospatial Data). Convert road-edge data to Shapefile and DEM data to GeoTIFF before use, as described in the paper. Run `python scripts/georeference.py --help` for the exact set of available options.
+Road-edge and DEM reference data can be obtained free of charge from your national mapping agency (in Japan: GSI's Fundamental Geospatial Data). Convert road-edge data to Shapefile and DEM data to GeoTIFF before use (see [Demo Data](#demo-data) for the exact source files used in this demo). Run `python scripts/georeference.py --help` for the exact set of available options.
+
+Results (georeferenced LAS as `g[n].las`, transformation matrix, overlay images, and an execution log) are written to `results/demo_georef/` (see [Output](#output) for the full naming convention).
 
 Key optional parameters (see `python scripts/georeference.py --help` for the full list):
 
@@ -140,20 +160,7 @@ Key optional parameters (see `python scripts/georeference.py --help` for the ful
 | `--dilate_iter` / `--close_kernel` | `1` / `7` | Morphological smoothing of the wall-slice image |
 | `--decay_coefficient` / `--search_range` / `--angle_min` / `--angle_max` / `--angle_step` / `--min_score` | `0.10` / `5.0` / `-5.0` / `5.0` / `0.25` / `0.15` | Template-matching search parameters for horizontal alignment |
 | `--smooth_kernel` / `--grid_res` / `--max_ground_samples` | `51` / `2.0` / `200000` | DEM-based vertical (Z) alignment parameters |
-| `--no_log` | off | Suppress overlay images / log output |
-
-## Method Summary
-
-**Registration**
-1. Extract mutually overlapping regions between source and target clouds via 2D (XY) nearest-neighbor search.
-2. Classify ground / non-ground points using CSF.
-3. **Horizontal:** slice non-ground points at increasing relative heights, orthographically project to a binary image, match via ORB + RANSAC, then refine with a Z-flattened 2D ICP.
-4. **Vertical:** fit a first-order tilt plane (`Δz ≈ a·x + b·y + c`) between horizontally-aligned source ground points and target ground points via least squares, then apply the correction to the full point cloud.
-
-**Georeferencing**
-1. Classify ground / non-ground points using CSF.
-2. **Horizontal:** project a non-ground wall slice to a binary image, generate a distance-transform similarity score image from road-edge vector data, and search for the best-matching translation/rotation via normalized cross-correlation template matching.
-3. **Vertical:** compute the elevation offset between ground points and a DEM on a coarse grid, gap-fill and smooth it, then apply the correction via bilinear interpolation — preserving fine-scale terrain detail while fitting the global elevation trend to the DEM.
+| `--no_log` | off | Suppress the `g[n]_log/` overlay images / execution log output |
 
 ## Citation
 
