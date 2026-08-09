@@ -227,26 +227,41 @@ class AutoRegistrator:
 
         return best_M, best_inliers_count
 
-    @timer
-    def calculate_mean(self, src_img, tgt_img, M):
-        if np.sum(src_img) == 0 or np.sum(tgt_img) == 0:
-            return float('inf')
+    def calculate_point2plane_rmse(self, src_nonground, tgt_nonground, M_pixel, k=6):
+            if src_nonground.is_empty() or tgt_nonground.is_empty():
+                return float('inf')
 
-        M_cv = M[:2, :]
-        src_y, src_x = np.where(src_img > 0)
-        if len(src_x) == 0:
-            return float('inf')
-        src_pts = np.column_stack([src_x, src_y]).astype(np.float32).reshape(-1, 1, 2)
-        src_pts_trans = cv2.transform(src_pts, M_cv).reshape(-1, 2)
+            src_transformed, _ = self.apply_transform(src_nonground, M_pixel)
 
-        tgt_y, tgt_x = np.where(tgt_img > 0)
-        if len(tgt_x) == 0:
-            return float('inf')
-        tgt_pts = np.column_stack([tgt_x, tgt_y])
+            src_pts = np.asarray(src_transformed.points)
+            tgt_pts = np.asarray(tgt_nonground.points)
 
-        tree = cKDTree(tgt_pts)
-        dists, _ = tree.query(src_pts_trans, k=1)
-        return np.mean(dists)
+            if len(src_pts) == 0 or len(tgt_pts) < k:
+                return float('inf')
+
+            tgt_tree = cKDTree(tgt_pts)
+
+            _, knn_idx = tgt_tree.query(src_pts, k=k, workers=-1)
+            if k == 1:
+                knn_idx = knn_idx.reshape(-1, 1)
+
+            neighbors = tgt_pts[knn_idx]                      
+            centroids = neighbors.mean(axis=1, keepdims=True) 
+            centered = neighbors - centroids
+            cov = np.einsum("nki,nkj->nij", centered, centered)  
+
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            normals = eigvecs[:, :, 0]
+
+            norms = np.linalg.norm(normals, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            normals = normals / norms
+
+            vec_to_centroid = src_pts - centroids.squeeze(1)
+            plane_dists = np.einsum("ni,ni->n", vec_to_centroid, normals)
+
+            rmse = np.sqrt(np.mean(plane_dists ** 2))
+            return rmse
 
     @timer
     def apply_transform(self, pcd, M_pixel):
@@ -489,7 +504,7 @@ class RegistrationExporter:
             if is_success:
                 f.write("\n--- Results ---\n")
                 f.write(f"Best height slice : {best_height:.1f}m\n")
-                f.write(f"ORB score         : {best_score:.2f}px\n")
+                f.write(f"Point2Plane RMSE  : {best_score:.4f}m\n")
                 f.write(f"ICP fitness       : {icp_fitness:.2f}\n")
                 f.write(f"ICP RMSE          : {icp_rmse:.4f}m\n")
                 if tilt_params:
@@ -534,7 +549,7 @@ def registration_main():
 
     # --- ORB-based registration ---
     parser.add_argument("--orb_nfeatures", type=int, default=5000, help="Number of ORB features to detect (default: 5000)")
-    parser.add_argument("--ransac_iter", type=int, default=10000, help="Number of RANSAC iterations (default: 10000)")
+    parser.add_argument("--ransac_iter", type=int, default=30000, help="Number of RANSAC iterations (default: 10000)")
     parser.add_argument("--ransac_threshold", type=float, default=3.0, help="RANSAC inlier threshold in pixels (default: 3.0)")
     parser.add_argument("--min_inliers", type=int, default=10, help="Minimum inlier count to accept an ORB match (default: 10)")
     parser.add_argument("--lowe_ratio", type=float, default=0.75, help="Lowe's ratio test threshold for ORB matching (default: 0.75)")
@@ -619,8 +634,8 @@ def registration_main():
         )
 
         if inliers > args.min_inliers:
-            score = registrator.calculate_mean(src_img, tgt_img, M_cand)
-            print(f"   H={h:.1f}m: error={score:.2f}px, inliers={inliers}")
+            score = registrator.calculate_point2plane_rmse(src_nonground, tgt_nonground, M_cand)
+            print(f"   H={h:.1f}m: rmse={score:.4f}m, inliers={inliers}")
             if score < best_score:
                 best_score = score
                 best_M = M_cand
@@ -634,7 +649,7 @@ def registration_main():
         print("\n!! Registration FAILED: no valid ORB matches found")
         T_final = np.eye(4)
     else:
-        print(f"\n   -> Best slice: H={best_height:.1f}m, score={best_score:.2f}px")
+        print(f"\n   -> Best slice: H={best_height:.1f}m, rmse={best_score:.4f}m")
 
         print(":: Applying ORB transform to full-resolution cloud")
         SRC_pts = np.vstack((SRC_las.x, SRC_las.y, SRC_las.z)).T
