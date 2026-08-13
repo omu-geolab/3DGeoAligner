@@ -542,8 +542,9 @@ def registration_main():
     parser.add_argument("--icp_relative_fitness", type=float, default=1e-6, help="ICP convergence criterion: relative fitness (default: 1e-6)")
     parser.add_argument("--icp_relative_rmse", type=float, default=1e-6, help="ICP convergence criterion: relative RMSE (default: 1e-6)")
     
-    # --- Log ---
+    # --- output ---
     parser.add_argument("--no_log", action="store_true", help="Suppress all intermediate and final image/log outputs (default: outputs enabled)")
+    parser.add_argument("--no_las", action="store_true", help="Suppress LAS file output (default: LAS output enabled)")
     
     args = parser.parse_args()
 
@@ -674,8 +675,9 @@ def registration_main():
         SRC_pts = np.asarray(SRC_aligned.points)
         SRC_pts[:, 2] += (a * SRC_pts[:, 0]) + (b * SRC_pts[:, 1]) + c
 
-        registrator.save_las(output_las_path, SRC_las, SRC_pts)
-
+        if not args.no_las:
+            registrator.save_las(output_las_path, SRC_las, SRC_pts)
+            
         process_time = datetime.datetime.now() - start_time
         print(f":: Total processing time: {process_time}s")
         ram_after = psutil.virtual_memory().used / 1024**3
