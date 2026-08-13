@@ -227,40 +227,22 @@ class AutoRegistrator:
 
         return best_M, best_inliers_count
 
-    def calculate_point2plane_rmse(self, src_nonground, tgt_nonground, M_pixel, k=6):
+    def point2point_rmse(self, src_nonground, tgt_nonground, M_pixel, k=6):
             if src_nonground.is_empty() or tgt_nonground.is_empty():
                 return float('inf')
 
             src_transformed, _ = self.apply_transform(src_nonground, M_pixel)
 
-            src_pts = np.asarray(src_transformed.points)
-            tgt_pts = np.asarray(tgt_nonground.points)
+            src_pts = np.asarray(src_transformed.points)[:,:2]
+            tgt_pts = np.asarray(tgt_nonground.points)[:,:2]
 
             if len(src_pts) == 0 or len(tgt_pts) < k:
                 return float('inf')
 
             tgt_tree = cKDTree(tgt_pts)
+            dists, _ = tgt_tree.query(src_pts, k=1, workers=-1)
+            rmse = np.sqrt(np.mean(dists ** 2))
 
-            _, knn_idx = tgt_tree.query(src_pts, k=k, workers=-1)
-            if k == 1:
-                knn_idx = knn_idx.reshape(-1, 1)
-
-            neighbors = tgt_pts[knn_idx]                      
-            centroids = neighbors.mean(axis=1, keepdims=True) 
-            centered = neighbors - centroids
-            cov = np.einsum("nki,nkj->nij", centered, centered)  
-
-            eigvals, eigvecs = np.linalg.eigh(cov)
-            normals = eigvecs[:, :, 0]
-
-            norms = np.linalg.norm(normals, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            normals = normals / norms
-
-            vec_to_centroid = src_pts - centroids.squeeze(1)
-            plane_dists = np.einsum("ni,ni->n", vec_to_centroid, normals)
-
-            rmse = np.sqrt(np.mean(plane_dists ** 2))
             return rmse
 
     @timer
@@ -504,7 +486,7 @@ class RegistrationExporter:
             if is_success:
                 f.write("\n--- Results ---\n")
                 f.write(f"Best height slice : {best_height:.1f}m\n")
-                f.write(f"Point2Plane RMSE  : {best_score:.4f}m\n")
+                f.write(f"Point2Point RMSE  : {best_score:.4f}m\n")
                 f.write(f"ICP fitness       : {icp_fitness:.2f}\n")
                 f.write(f"ICP RMSE          : {icp_rmse:.4f}m\n")
                 if tilt_params:
@@ -634,7 +616,7 @@ def registration_main():
         )
 
         if inliers > args.min_inliers:
-            score = registrator.calculate_point2plane_rmse(src_nonground, tgt_nonground, M_cand)
+            score = registrator.point2point_rmse(src_nonground, tgt_nonground, M_cand)
             print(f"   H={h:.1f}m: rmse={score:.4f}m, inliers={inliers}")
             if score < best_score:
                 best_score = score
