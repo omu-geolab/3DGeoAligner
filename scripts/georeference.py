@@ -206,7 +206,7 @@ class AutoGeoreferencer:
             return None
 
         tree = cKDTree(ground_pts[:, :2])
-        _, idx = tree.query(nonground_pts[:, :2], k=1)
+        _, idx = tree.query(nonground_pts[:, :2], k=1, workers=-1)
         ground_z = ground_pts[idx, 2]
         rel_z = nonground_pts[:, 2] - ground_z
         

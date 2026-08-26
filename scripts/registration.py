@@ -43,6 +43,7 @@ class AutoRegistrator:
         self.max_xy = None
         self.img_w = 0
         self.img_h = 0
+        self.slice_diff_cache = {}
 
     @timer
     def load_las(self, input_path, keep_raw):
@@ -117,19 +118,24 @@ class AutoRegistrator:
 
     @timer
     def extract_slice(self, non_ground, ground, h_min, h_max):
-        pts_ng = np.asarray(non_ground.points)
-        pts_g = np.asarray(ground.points)
+        cache_key = (id(non_ground), id(ground))
+        diff = self.slice_diff_cache.get(cache_key)
 
-        if len(pts_g) == 0 or len(pts_ng) == 0:
-            return o3d.geometry.PointCloud()
+        if diff is None:
+            pts_ng = np.asarray(non_ground.points)
+            pts_g = np.asarray(ground.points)
 
-        tree = cKDTree(pts_g[:, :2])
-        _, idx = tree.query(pts_ng[:, :2], k=1)
-        ground_z = pts_g[idx, 2]
+            if len(pts_g) == 0 or len(pts_ng) == 0:
+                return o3d.geometry.PointCloud()
 
-        diff = pts_ng[:, 2] - ground_z
+            tree = cKDTree(pts_g[:, :2])
+            _, idx = tree.query(pts_ng[:, :2], k=1, workers=-1)
+            ground_z = pts_g[idx, 2]
+
+            diff = pts_ng[:, 2] - ground_z
+            self.slice_diff_cache[cache_key] = diff
+
         mask = (diff >= h_min) & (diff < h_max)
-
         return non_ground.select_by_index(np.where(mask)[0])
 
     @timer
@@ -321,7 +327,7 @@ class AutoRegistrator:
             return 0.0, 0.0, 0.0
 
         tree = cKDTree(tgt_pts[:, :2])
-        dists, indices = tree.query(src_pts[:, :2], k=1, distance_upper_bound=0.5)
+        dists, indices = tree.query(src_pts[:, :2], k=1, distance_upper_bound=0.5, workers=-1)
 
         valid = dists != float('inf')
         if np.sum(valid) < 10:
@@ -531,7 +537,7 @@ def registration_main():
 
     # --- ORB-based registration ---
     parser.add_argument("--orb_nfeatures", type=int, default=5000, help="Number of ORB features to detect (default: 5000)")
-    parser.add_argument("--ransac_iter", type=int, default=30000, help="Number of RANSAC iterations (default: 10000)")
+    parser.add_argument("--ransac_iter", type=int, default=10000, help="Number of RANSAC iterations (default: 10000)")
     parser.add_argument("--ransac_threshold", type=float, default=3.0, help="RANSAC inlier threshold in pixels (default: 3.0)")
     parser.add_argument("--min_inliers", type=int, default=10, help="Minimum inlier count to accept an ORB match (default: 10)")
     parser.add_argument("--lowe_ratio", type=float, default=0.75, help="Lowe's ratio test threshold for ORB matching (default: 0.75)")
