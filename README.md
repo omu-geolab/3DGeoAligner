@@ -167,8 +167,8 @@ Key optional parameters (see `python scripts/georeference.py --help` for the ful
 If you use this pipeline in your research, please cite:
 
 ```
-Ueda, R., Yoshida, D., 2026. A Pipeline for Low-Cost Wide-Area 3D Mapping Using
-LiDAR-Equipped Mobile Devices and Open Data. ISPRS.
+Ueda, R., & Yoshida, D. (2026). A Pipeline for Low-Cost Wide-Area 3D Mapping 
+Using LiDAR-Equipped Mobile Devices and Open Data. Jxiv. https://doi.org/10.51094/jxiv.5767
 ```
 
 ## Acknowledgements
