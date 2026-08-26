@@ -4,7 +4,7 @@
 
 This repository provides the reference implementation of the method described in:
 
-> Ueda, R., Yoshida, D. *A Pipeline for Low-Cost Wide-Area 3D Mapping Using LiDAR-Equipped Mobile Devices and Open Data.* (ISPRS, 2026)
+> Ueda, R., Yoshida, D. *[A Pipeline for Low-Cost Wide-Area 3D Mapping Using LiDAR-Equipped Mobile Devices and Open Data.](https://doi.org/10.51094/jxiv.5767)* (Jxiv, 2026)
 
 The pipeline integrates multiple locally captured point clouds into a single, georeferenced 3D map. The process requires only mobile devices (e.g. iPhone Pro/iPad) and open geospatial data (Road Edge Data and 5m DEM).
 
