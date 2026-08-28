@@ -12,6 +12,8 @@ The core idea is to **decompose 3D registration and georeferencing into independ
 
 ## Pipeline Overview
 
+<img width="1080" height="1080" alt="demo_play" src="https://github.com/user-attachments/assets/cf41f60c-a75a-4a1f-ac28-b3fe2144c4b4" />
+
 | Stage | Script | Description |
 |---|---|---|
 | **Registration** | `scripts/registration.py` | Aligns a source point cloud to a target (adjacent) point cloud. |
