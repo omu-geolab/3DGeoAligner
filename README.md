@@ -12,7 +12,7 @@ The core idea is to **decompose 3D registration and georeferencing into independ
 
 ## Pipeline Overview
 
-<div style="text-align: center;">
+<div align="center">
   <img width="540" height="540" alt="demo_play" src="https://github.com/user-attachments/assets/cf41f60c-a75a-4a1f-ac28-b3fe2144c4b4" />
 </div>
 
