@@ -4,7 +4,7 @@
 
 This repository provides the reference implementation of the method described in:
 
-> Ueda, R., Yoshida, D. *[A Pipeline for Low-Cost Wide-Area 3D Mapping Using LiDAR-Equipped Mobile Devices and Open Data.](https://doi.org/10.51094/jxiv.5767)* (Jxiv, 2026)
+> Ueda, R., Yoshida, D. *[A Pipeline for Low-Cost Wide-Area 3D Mapping Using LiDAR-Equipped Mobile Devices and Open Data.](https://doi.org/10.5194/isprs-archives-L-4-W1-2026-319-2026)* (Int. Arch. Photogramm. Remote Sens. Spatial Inf. Sci., 2026)
 
 The pipeline integrates multiple locally captured point clouds into a single, georeferenced 3D map. The process requires only mobile devices (e.g. iPhone Pro/iPad) and open geospatial data (Road Edge Data and 5m DEM).
 
@@ -171,8 +171,7 @@ Key optional parameters (see `python scripts/georeference.py --help` for the ful
 If you use this pipeline in your research, please cite:
 
 ```
-Ueda, R., & Yoshida, D. (2026). A Pipeline for Low-Cost Wide-Area 3D Mapping 
-Using LiDAR-Equipped Mobile Devices and Open Data. Jxiv. https://doi.org/10.51094/jxiv.5767
+Ueda, R. and Yoshida, D.: A Pipeline for Low-Cost Wide-Area 3D Mapping Using LiDAR-Equipped Mobile Devices and Open Data, Int. Arch. Photogramm. Remote Sens. Spatial Inf. Sci., L-4/W1-2026, 319–326, https://doi.org/10.5194/isprs-archives-L-4-W1-2026-319-2026, 2026.
 ```
 
 ## Acknowledgements
